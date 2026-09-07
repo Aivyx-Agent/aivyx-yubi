@@ -107,10 +107,32 @@
 //! [Lc data] [Le]`, matched on `INS`/`P1`/`P2` — see `ocard/commands.rs`
 //! and `ocard/apdu/command.rs` for the real command bytes and wire format,
 //! and `ocard/mod.rs`'s `StatusBytes` `From<(u8,u8)>` impl for the real
-//! status-word mapping used for failure responses below). Since this crate
-//! never advertises extended-length support in `CardCaps`, every command
-//! this fake ever receives is short-form (`Lc`/`Le` are single bytes), which
-//! keeps response parsing simple.
+//! status-word mapping used for failure responses below).
+//!
+//! Every command this fake receives today happens to be short-form
+//! (`Lc`/`Le` are single bytes) — but *not* because this fake never
+//! advertises extended-length support. It does: the Historical Bytes
+//! fixture below (tag `5F52`) sets `CardCapabilities` byte 3 bit 6
+//! (`extended_lc_le`), and `openpgp-card` reads that straight into
+//! `CardCaps.ext_support = true` (`OpenPGP::new`, `ocard/mod.rs`:
+//! `ext_support = cc.extended_lc_le()`). What actually keeps commands
+//! short-form is that `openpgp-card` only switches to extended `Lc`/`Le`
+//! when *both* `ext_support` is true *and* `max_cmd_bytes > 0xFF`
+//! (`ocard/apdu.rs`: `let ext_len = ext_support && (max_cmd_bytes >
+//! 0xFF);`) — and this fake's effective `max_cmd_bytes` falls back to the
+//! default `255`, because it omits the Extended Length Information DO
+//! (tag `7F66`) and `ExtendedCapabilities`'s `max_cmd_len`/`max_resp_len`
+//! fields are only populated for card version 2.x
+//! (`ocard/data/extended_cap.rs`), while this fixture claims version 3.4.
+//!
+//! **This is fragile**: if a later change adds tag `7F66` to
+//! [`build_application_related_data`] "for realism", `max_cmd_bytes` will
+//! exceed 255, `ext_len` flips true, `Lc` becomes the 3-byte extended
+//! form, and this fake's current short-form-only command parsing (the
+//! `lc`/`cmd.get` line in [`CardTransaction::transmit`]'s `VERIFY` arm)
+//! will silently misparse every subsequent command (e.g. treating every
+//! PIN as empty) instead of failing loudly. Anyone adding that DO must
+//! also add extended-length command parsing here.
 //!
 //! The fake's "Application Related Data" (GET DATA tag `6E`, returned on
 //! `SELECT` + subsequent reads) is a hand-built, spec-correct TLV rather
@@ -154,8 +176,35 @@
 //!   (`Err(SmartcardError::CardNotFound(..))`), matching where
 //!   `card-backend-pcsc` itself would surface that failure (see
 //!   `card-backend-pcsc-0.5.2/src/lib.rs`'s `from_pcsc_reader`).
+//! - **PIN-verification session state IS enforced**, unlike the above
+//!   fake-only conveniences: [`FakeCard`] tracks `verified_pw1_sign`/
+//!   `verified_pw3_admin` and rejects `PSO: COMPUTE DIGITAL SIGNATURE` /
+//!   `GENERATE ASYMMETRIC KEY PAIR` with the real `6982
+//!   SecurityStatusNotSatisfied` status word (`ocard/mod.rs`'s
+//!   `StatusBytes::SecurityStatusNotSatisfied`, mapped from `(0x69,
+//!   0x82)`) if the matching `VERIFY` hasn't succeeded first — so a real
+//!   bug in a later task that forgets to verify the PIN before signing
+//!   or generating a key fails its test against this fake instead of
+//!   silently passing. Both flags reset to `false` on every fresh
+//!   `CardBackend::transaction()` call, an approximation of a real card's
+//!   behavior (which actually keeps PIN-verified state until a card
+//!   reset/power-cycle, not per logical PC/SC transaction) chosen because
+//!   `transaction()` is the only session boundary the `CardBackend` trait
+//!   itself exposes.
+//! - **[`FakeCard::is_default_pins`]/[`FakeCard::signing_key_generated`]
+//!   are unreachable once the fake is boxed**: `Card::new(fake_card)`
+//!   moves the fake into an opaque `Box<dyn CardBackend + Send + Sync>`
+//!   with no handle retained, so nothing can call these `&self` inspection
+//!   methods again afterwards. A caller that needs to inspect fake state
+//!   post-construction currently has no way to; wrapping the mutable
+//!   state in `Arc<Mutex<..>>` internally (so a cheap clone of the shared
+//!   handle could be retained before the move) would fix this, but is
+//!   left as a known limitation for a later task to pick up if it turns
+//!   out to be needed, rather than speculatively adding now.
 
-use card_backend::{CardBackend, CardCaps, CardTransaction, PinType as BackendPinType, SmartcardError};
+use card_backend::{
+    CardBackend, CardCaps, CardTransaction, PinType as BackendPinType, SmartcardError,
+};
 
 // ---------------------------------------------------------------------
 // Real APDU constants, grounded in `openpgp-card-0.7.0/src/ocard/commands.rs`
@@ -282,13 +331,23 @@ fn build_application_related_data(manufacturer: u16, serial: u32, uif_sig: [u8; 
     let key_info = [0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
 
     // Historical Bytes (tag 5F52). Real YubiKey 5 fixture bytes from
-    // `ocard/data/historical.rs::test_yk5`. Required, not optional: despite
-    // `Transaction::historical_bytes()`'s public signature returning
-    // `Option<HistoricalBytes>`, `OpenPGP::new` reads it with a bare `?`
-    // (`hb: Some(ard.historical_bytes()?)`), so a card missing this DO
-    // fails construction entirely — confirmed the hard way, this fake
-    // originally omitted it and every test failed with `NotFound("Failed
-    // to get historical bytes.")`.
+    // `ocard/data/historical.rs::test_yk5`. Required, not optional — but
+    // note there are actually *two* distinct `historical_bytes` methods
+    // in the real crate, easy to conflate:
+    //   1. `ocard::data::ApplicationRelatedData::historical_bytes()
+    //      -> Result<HistoricalBytes, Error>` (`ocard/data.rs`), which
+    //      errors with `Error::NotFound` if the DO is absent, and which
+    //      `OpenPGP::new` calls with a bare `?`
+    //      (`hb: Some(ard.historical_bytes()?)`, `ocard/mod.rs`) — so a
+    //      card missing this DO fails construction entirely. Confirmed
+    //      the hard way: this fake originally omitted it and every test
+    //      failed with `NotFound("Failed to get historical bytes.")`.
+    //   2. `ocard::Transaction::historical_bytes()
+    //      -> Result<Option<HistoricalBytes>, Error>` (`ocard/mod.rs`),
+    //      a separate, later, Option-typed accessor over the
+    //      *already-cached* value. By the time anything can call this
+    //      one, construction (and thus method 1's `?`) has already
+    //      succeeded, so in practice it can never observe `None`.
     let historical_bytes = [0x00, 0x73, 0x00, 0x00, 0xe0, 0x05, 0x90, 0x00];
 
     let mut out = Vec::new();
@@ -341,7 +400,15 @@ impl PinSlot {
         if presented == self.current.as_slice() {
             self.retries_left = 3;
             [0x90, 0x00] // StatusBytes::Ok
-        } else if self.retries_left <= 1 {
+        } else if self.retries_left < 1 {
+            // Already at 0 retries (blocked): reject outright without
+            // decrementing further. Using `< 1` (not `<= 1`) matters — a
+            // real card lets all 3 wrong attempts decrement the counter
+            // and report `PasswordNotChecked(2)`, `(1)`, `(0)` in turn;
+            // it's only the *next* attempt, made with the counter already
+            // at 0, that gets `AuthenticationMethodBlocked`. `<= 1` would
+            // instead intercept the 3rd wrong attempt itself and block it
+            // pre-emptively, one attempt early.
             self.retries_left = 0;
             [0x69, 0x83] // StatusBytes::AuthenticationMethodBlocked
         } else {
@@ -367,6 +434,14 @@ pub struct FakeCard {
     uif_sig: [u8; 2],
     signing_key_generated: bool,
     touch_timeout: bool,
+    /// PW1 (signing mode, VERIFY P2 `0x81`) has been successfully
+    /// verified in the current session. Gates `PSO: COMPUTE DIGITAL
+    /// SIGNATURE`. See this module's doc comment, section 5.
+    verified_pw1_sign: bool,
+    /// PW3 (admin, VERIFY P2 `0x83`) has been successfully verified in
+    /// the current session. Gates `GENERATE ASYMMETRIC KEY PAIR`. See
+    /// this module's doc comment, section 5.
+    verified_pw3_admin: bool,
 }
 
 impl FakeCard {
@@ -383,6 +458,8 @@ impl FakeCard {
             uif_sig: [0x00, 0x20], // TouchPolicy::Off, Features::Button
             signing_key_generated: false,
             touch_timeout: false,
+            verified_pw1_sign: false,
+            verified_pw3_admin: false,
         }
     }
 
@@ -426,7 +503,8 @@ impl FakeCard {
     /// 5. Provided so tests can assert on fixture *intent* without also
     /// hardcoding the default PIN bytes at every call site.
     pub fn is_default_pins(&self) -> bool {
-        self.pw1.current == FACTORY_DEFAULT_USER_PIN && self.pw3.current == FACTORY_DEFAULT_ADMIN_PIN
+        self.pw1.current == FACTORY_DEFAULT_USER_PIN
+            && self.pw3.current == FACTORY_DEFAULT_ADMIN_PIN
     }
 
     /// Fake-only accessor: has a signing key been generated on this fake
@@ -481,6 +559,11 @@ impl CardBackend for FakeCard {
                 "fake card is absent".to_string(),
             ));
         }
+        // A fresh transaction is this fake's session boundary: PIN
+        // verification doesn't carry over (see this module's doc
+        // comment, section 5).
+        self.verified_pw1_sign = false;
+        self.verified_pw3_admin = false;
         Ok(Box::new(FakeCardTransaction { card: self }))
     }
 }
@@ -518,23 +601,54 @@ impl CardTransaction for FakeCardTransaction<'_> {
             }
 
             ins::VERIFY => {
-                let slot = match p2 {
-                    VERIFY_P2_SIGN | VERIFY_P2_USER => &mut self.card.pw1,
-                    VERIFY_P2_ADMIN => &mut self.card.pw3,
-                    _ => return Ok(vec![0x6A, 0x86]), // StatusBytes: incorrect P1-P2 (unmapped in this fake)
-                };
+                if !matches!(p2, VERIFY_P2_SIGN | VERIFY_P2_USER | VERIFY_P2_ADMIN) {
+                    return Ok(vec![0x6A, 0x86]); // StatusBytes: incorrect P1-P2 (unmapped in this fake)
+                }
 
                 if cmd.len() == 4 {
                     // Empty-data "check" form (`check_pw1_user` etc.): this
                     // fake doesn't track a persistent "already verified"
-                    // session flag, so it always reports "not verified yet".
-                    let n = slot.retries_left;
-                    Ok(vec![0x63, 0xC0 | n])
-                } else {
-                    let lc = cmd[4] as usize;
-                    let pin = cmd.get(5..5 + lc).unwrap_or(&[]);
-                    Ok(slot.verify(pin).to_vec())
+                    // session flag for *this* query form, so it always
+                    // reports "not verified yet" here regardless of
+                    // `verified_pw1_sign`/`verified_pw3_admin` below (which
+                    // gate `PSO`/`GENERATE ASYMMETRIC KEY PAIR` instead).
+                    let n = match p2 {
+                        VERIFY_P2_SIGN | VERIFY_P2_USER => self.card.pw1.retries_left,
+                        _ => self.card.pw3.retries_left,
+                    };
+                    return Ok(vec![0x63, 0xC0 | n]);
                 }
+
+                // Short-form Lc only (single byte). Safe *today* only
+                // because this fake's effective `max_cmd_bytes` falls
+                // back to 255 (no Extended Length Information DO, tag
+                // `7F66`) — see this module's doc comment, section 4, for
+                // why `CardCaps.ext_support` being true does NOT already
+                // mean extended-length parsing is needed here, and why
+                // adding that DO later would silently break this line
+                // (e.g. treating every PIN as empty) instead of failing
+                // loudly.
+                let lc = cmd[4] as usize;
+                let pin = cmd.get(5..5 + lc).unwrap_or(&[]);
+
+                let status = match p2 {
+                    VERIFY_P2_SIGN | VERIFY_P2_USER => self.card.pw1.verify(pin),
+                    _ => self.card.pw3.verify(pin),
+                };
+                let verified = status == [0x90, 0x00];
+
+                // Track session verification state for the security-gate
+                // checks on `PSO`/`GENERATE ASYMMETRIC KEY PAIR` below. A
+                // failed VERIFY explicitly un-verifies (matches real card
+                // behavior: a wrong PIN invalidates any prior successful
+                // verification for that key reference).
+                match p2 {
+                    VERIFY_P2_SIGN => self.card.verified_pw1_sign = verified,
+                    VERIFY_P2_ADMIN => self.card.verified_pw3_admin = verified,
+                    _ => {}
+                }
+
+                Ok(status.to_vec())
             }
 
             ins::GENERATE_ASYMMETRIC_KEY_PAIR => {
@@ -544,10 +658,18 @@ impl CardTransaction for FakeCardTransaction<'_> {
                 // — later tasks only ever generate that one slot.
                 match p1 {
                     0x80 => {
+                        if !self.card.verified_pw3_admin {
+                            // StatusBytes::SecurityStatusNotSatisfied — a
+                            // real card requires PW3 (admin) VERIFYed
+                            // before key generation (I-1 finding).
+                            return Ok(vec![0x69, 0x82]);
+                        }
                         self.card.signing_key_generated = true;
                         Ok(ok(build_generate_key_response()))
                     }
-                    0x81 if self.card.signing_key_generated => Ok(ok(build_generate_key_response())),
+                    0x81 if self.card.signing_key_generated => {
+                        Ok(ok(build_generate_key_response()))
+                    }
                     _ => Ok(vec![0x6A, 0x88]), // no key generated yet
                 }
             }
@@ -571,6 +693,12 @@ impl CardTransaction for FakeCardTransaction<'_> {
             }
 
             ins::PSO if (p1, p2) == PSO_COMPUTE_DIGITAL_SIGNATURE => {
+                if !self.card.verified_pw1_sign {
+                    // StatusBytes::SecurityStatusNotSatisfied — a real
+                    // card requires PW1 (signing mode) VERIFYed before
+                    // PSO: COMPUTE DIGITAL SIGNATURE (I-1 finding).
+                    return Ok(vec![0x69, 0x82]);
+                }
                 if self.card.touch_timeout {
                     return Err(SmartcardError::Error(
                         "reader timed out waiting for touch confirmation".to_string(),
@@ -596,9 +724,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
         _pin: BackendPinType,
         _card_caps: &Option<CardCaps>,
     ) -> Result<Vec<u8>, SmartcardError> {
-        Err(SmartcardError::Error(
-            "fake card has no pinpad".to_string(),
-        ))
+        Err(SmartcardError::Error("fake card has no pinpad".to_string()))
     }
 
     fn pinpad_modify(
@@ -606,9 +732,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
         _pin: BackendPinType,
         _card_caps: &Option<CardCaps>,
     ) -> Result<Vec<u8>, SmartcardError> {
-        Err(SmartcardError::Error(
-            "fake card has no pinpad".to_string(),
-        ))
+        Err(SmartcardError::Error("fake card has no pinpad".to_string()))
     }
 
     fn was_reset(&self) -> bool {
@@ -677,10 +801,7 @@ mod tests {
         }
 
         admin
-            .set_touch_policy(
-                KeyType::Signing,
-                openpgp_card::ocard::data::TouchPolicy::On,
-            )
+            .set_touch_policy(KeyType::Signing, openpgp_card::ocard::data::TouchPolicy::On)
             .expect("touch policy should be settable against the fake");
 
         // `admin` borrows `tx` mutably; it's not used again, so NLL ends
@@ -727,6 +848,67 @@ mod tests {
                 assert!(matches!(
                     status,
                     openpgp_card::ocard::StatusBytes::PasswordNotChecked(_)
+                ));
+            }
+            other => panic!("expected a CardStatus error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signing_without_verified_pin_is_rejected_as_security_status_not_satisfied() {
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+
+        // No `verify_user_signing_pin` call at all: a real implementation
+        // bug in a later task that forgets to verify PW1 before signing
+        // must fail against this fake, not silently pass (I-1 finding).
+        let err = tx
+            .card()
+            .signature_for_hash(SigningAlgo::ECC, b"some message digest")
+            .expect_err("signing without a verified PIN should be rejected");
+
+        match err {
+            openpgp_card::Error::CardStatus(status) => {
+                assert!(matches!(
+                    status,
+                    openpgp_card::ocard::StatusBytes::SecurityStatusNotSatisfied
+                ));
+            }
+            other => panic!("expected a CardStatus error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generating_a_key_without_verified_admin_pin_is_rejected_as_security_status_not_satisfied() {
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+
+        fn fake_fingerprint(
+            _pub_key: &PublicKeyMaterial,
+            _ts: KeyGenerationTime,
+            _key_type: KeyType,
+        ) -> Result<Fingerprint, openpgp_card::Error> {
+            Fingerprint::try_from(&[0xEE_u8; 20][..])
+        }
+
+        // No `as_admin_card`/`verify_admin_pin` call at all: reach the
+        // low-level `generate_key` directly via the same `card()` escape
+        // hatch grounding point 3 uses for signing, so this exercises the
+        // fake's own gating rather than the typed `Card<Admin>` wrapper
+        // (which would force verification first and could hide a bug in
+        // this fake instead of catching it).
+        let err = tx
+            .card()
+            .generate_key(fake_fingerprint, KeyType::Signing)
+            .expect_err("key generation without a verified admin PIN should be rejected");
+
+        match err {
+            openpgp_card::Error::CardStatus(status) => {
+                assert!(matches!(
+                    status,
+                    openpgp_card::ocard::StatusBytes::SecurityStatusNotSatisfied
                 ));
             }
             other => panic!("expected a CardStatus error, got {other:?}"),
