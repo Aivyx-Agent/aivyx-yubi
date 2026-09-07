@@ -149,13 +149,28 @@ entirely on the hardware path.
 synchronous today (`fn sign_request(&self, body: &[u8]) -> SignedHeader`).
 A touch-required hardware signature can legitimately block for several
 seconds waiting on a physical tap — calling that synchronously from
-inside `aivyx-channel`'s async daemon would stall a Tokio worker thread.
+inside an async daemon would stall a Tokio worker thread.
 `Identity::sign_request` becomes `async fn`, returning
 `Result<SignedHeader, FederationError>` (a new error case is added for
-"card absent" and "touch timeout" — see below). Every existing call site
-is already inside `aivyx-channel`'s async context, so this is a
-mechanical `.await` addition at each site, not a structural rework of
-the callers.
+"card absent" and "touch timeout" — see below).
+
+**Corrected during implementation-plan grounding**: this design's
+earlier draft claimed "every existing call site is already inside
+`aivyx-channel`'s async context" — checked directly against the real
+codebase and found false. `aivyx-federation` has **zero production call
+sites anywhere in the workspace today**: no crate depends on it in its
+`Cargo.toml` except its own dev-dependencies, and every existing call to
+`sign_request`/`sign_relay` is inside `aivyx-federation`'s own test
+modules (`identity.rs`'s and `relay.rs`'s `#[cfg(test)]` blocks). It's a
+self-contained "keystone" primitive (per `docs/FEDERATION.md`'s own
+framing — the Nexus/Factory products that would actually drive it live
+outside this repo). This makes the async change lower-risk than
+originally stated (nothing real breaks), but it also means the CLI
+subcommand this project adds (`aivyx federation yubikey-init`) is the
+**first** production wiring of `aivyx-federation` into `aivyx-cli` at
+all — a new `aivyx_modules/federation.rs` and a new `aivyx-federation`
+dependency edge in `aivyx-cli`'s own `Cargo.toml`, not an addition to an
+existing subcommand namespace.
 
 ## Error handling & operational behavior
 
