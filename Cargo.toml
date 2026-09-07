@@ -10,5 +10,30 @@ openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 thiserror = "2"
 tracing = "0.1.44"
+# Needed directly (not just transitively via openpgp-card) because
+# `openpgp_card::card_backend::{CardBackend, CardTransaction}` doesn't
+# exist: those traits live in the separate `card-backend` crate and
+# openpgp-card does NOT re-export them. Implementing a fake backend (see
+# src/testing.rs) means implementing `card_backend::CardBackend` and
+# `card_backend::CardTransaction` directly, so this crate needs its own
+# dependency on `card-backend`. Pinned to "0.2" to match the exact
+# version openpgp-card 0.7.0 depends on (Cargo.lock resolves both to the
+# same instance; a mismatched major version would produce two distinct,
+# incompatible `CardBackend` trait definitions).
+card-backend = "0.2"
+# Needed directly because `openpgp_card::Card`'s public PIN-verification
+# methods (`verify_user_pin`, `verify_admin_pin`, etc.) take
+# `secrecy::SecretString` by value; callers must construct one. Pinned to
+# "0.10" to match the version openpgp-card 0.7.0 depends on.
+secrecy = "0.10"
 
 [dev-dependencies]
+
+[features]
+# Gates `pub mod testing` (the fake CardBackend/CardTransaction test
+# double) for use from outside this crate's own `#[cfg(test)]` builds,
+# e.g. from integration tests under `tests/` in later tasks, which are
+# compiled as separate crates and don't automatically get `cfg(test)`
+# for this library. Plain `cargo test` already exercises `src/testing.rs`
+# without this flag (see its own module doc for why).
+test-util = []

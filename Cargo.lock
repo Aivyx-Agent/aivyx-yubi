@@ -6,8 +6,10 @@ version = 4
 name = "aivyx-yubi"
 version = "0.1.0"
 dependencies = [
+ "card-backend",
  "card-backend-pcsc",
  "openpgp-card",
+ "secrecy",
  "thiserror 2.0.20",
  "tracing",
 ]
