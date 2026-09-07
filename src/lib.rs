@@ -29,9 +29,9 @@ pub mod testing;
 use openpgp_card::ocard::StatusBytes;
 
 /// This crate's public error type — every public function in
-/// `discovery`/`pin`/`provision` (and a later task's `sign`) returns this,
-/// rather than leaking `openpgp_card::Error` or
-/// `card_backend::SmartcardError` directly, so downstream callers
+/// `discovery`/`pin`/`provision`/`sign` returns this, rather than leaking
+/// `openpgp_card::Error` or `card_backend::SmartcardError` directly, so
+/// downstream callers
 /// (`aivyx-federation`, `aivyx-cli`) get a stable, crate-local error type
 /// instead of depending on this crate's own dependency versions.
 ///
@@ -60,18 +60,25 @@ pub enum YubiError {
     PinStillFactoryDefault,
 
     /// The inserted card's serial doesn't match a previously bound one.
-    /// Not constructed anywhere in this crate today — `aivyx-yubi` itself
-    /// has no concept of a persisted binding record, that lives in
-    /// `aivyx-federation` (see the design spec's Task 7) — but defined
-    /// here since this is this crate's shared public error type and that
-    /// caller needs a variant to map its own "wrong card" check into.
+    /// Constructed by `sign::YubiKeySigner::sign` (this crate's own check
+    /// that the card it just discovered is the same one it was
+    /// constructed against — see `sign.rs`'s doc comment). Also available
+    /// for `aivyx-federation` (see the design spec's Task 7) to construct
+    /// against its own persisted binding record, a concept `aivyx-yubi`
+    /// itself has none of.
     #[error("wrong YubiKey inserted: expected card serial {expected}, found {found}")]
     WrongCard { expected: String, found: String },
 
     /// The card's own touch-confirmation timeout elapsed before the
-    /// operator tapped the key. Not produced by this task's code (no
-    /// signing yet, see Task 4/5) — defined here for that later signing
-    /// path, which returns this same error type.
+    /// operator tapped the key. Produced by `sign`'s private
+    /// `map_sign_error` at the `PSO: COMPUTE DIGITAL SIGNATURE` call site,
+    /// from either of two real shapes: the OpenPGP applet's own `69 85`
+    /// "Condition of use not satisfied" status word (its UIF touch
+    /// window, ~15s, expiring while the card is still able to answer), or
+    /// the transport-level `"Transmit failed: Timeout"` string a PC/SC
+    /// reader produces if it's still blocked in `transmit()` when the
+    /// window expires instead — see `sign.rs`'s own doc comment for the
+    /// full grounding.
     #[error("timed out waiting for a physical touch confirmation on the card")]
     TouchTimeout,
 

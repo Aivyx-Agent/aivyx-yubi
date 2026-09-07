@@ -57,45 +57,58 @@
 //!
 //! # Grounding: detecting a touch timeout
 //!
-//! A touch timeout is **not** a card status word — the OpenPGP card never
-//! gets to answer at all while the reader is still blocked waiting for
-//! the physical tap, so it surfaces as a *transport*-level failure from
-//! `transmit()` itself (`testing.rs`'s doc comment, section 5, and its
-//! `with_touch_timeout` fixture, confirmed directly against real
-//! `card-backend-pcsc` behavior below). Concretely, traced through the
-//! real dependency chain:
-//! - `pcsc` 2.9.0 (`src/lib.rs`): `Error::Timeout = SCARD_E_TIMEOUT`, a
-//!   fieldless enum variant, so `format!("{e:?}")` on it renders exactly
-//!   `"Timeout"`.
-//! - `card-backend-pcsc` 0.5.2 (`src/lib.rs`, `PcscTransaction::transmit`,
-//!   line ~274): every `pcsc::Error` other than `NotTransacted` falls
-//!   through a catch-all arm, `SmartcardError::Error(format!("Transmit
-//!   failed: {e:?}"))` — so a real reader timeout surfaces as
-//!   `SmartcardError::Error("Transmit failed: Timeout")` specifically,
-//!   with no dedicated timeout variant to match on structurally.
-//! - `openpgp-card` wraps that as `Error::Smartcard(SmartcardError::Error(..))`
-//!   (confirmed by `testing.rs::tests::touch_timeout_surfaces_as_a_smartcard_error`,
-//!   which asserts exactly this against the fake).
+//! A touch timeout can surface as **two** different real shapes, and
+//! `map_sign_error` (a private function — see this file's own source, not
+//! doc-linkable) covers both rather than betting everything on one:
 //!
-//! [`map_sign_error`] therefore maps **any** `Error::Smartcard(_)`
-//! encountered specifically at the `PSO:CDS` call site (not elsewhere —
-//! see its own doc comment) to [`YubiError::TouchTimeout`], rather than
-//! trying to pattern-match or substring-match the message text (which
-//! would be fragile: the fake's own fixture text, `"reader timed out
-//! waiting for touch confirmation"`, doesn't even contain the literal
-//! substring `"timeout"`). This is a deliberate, honestly-documented
-//! approximation, not a structurally sound discriminant: with the
-//! Signature slot's touch policy fixed to `Fixed` (this crate's design
-//! constraint, set once by `provision::set_signature_touch_policy_fixed`),
-//! an operator not tapping the key in time is overwhelmingly the real
-//! cause of any transport-level failure occurring at exactly this call —
-//! but a genuinely different transport fault at that same instant (e.g.
-//! the device being physically unplugged mid-signature) would also be
-//! misreported as `TouchTimeout` under this mapping. Accepted as the
-//! better trade-off: the alternative (falling through to the generic
-//! [`YubiError::Other`]) is less actionable for the overwhelmingly common
-//! case, and there is no structured PC/SC signal this crate's
-//! dependencies expose to distinguish the two.
+//! 1. **A card status word.** The OpenPGP card spec's own `69 85`
+//!    "Condition of use not satisfied" status — real, confirmed against
+//!    `openpgp-card-0.7.0/src/ocard/mod.rs` line ~1556's status-word
+//!    mapping (`(0x69, 0x85) => StatusBytes::ConditionOfUseNotSatisfied`)
+//!    — is what the OpenPGP applet itself returns when its UIF touch
+//!    window (~15s) expires *while the card is still able to answer* (not
+//!    blocked mid-transmit). `map_sign_error` maps
+//!    `Error::CardStatus(StatusBytes::ConditionOfUseNotSatisfied)` to
+//!    [`YubiError::TouchTimeout`] as the primary, structurally sound
+//!    signal for this.
+//! 2. **A transport-level failure**, if the touch window instead expires
+//!    while the reader is still blocked inside `transmit()` itself (the
+//!    card never gets to answer at all — `testing.rs`'s doc comment,
+//!    section 5, and its `with_touch_timeout` fixture). Traced through the
+//!    real dependency chain:
+//!    - `pcsc` 2.9.0 (`src/lib.rs`): `Error::Timeout = SCARD_E_TIMEOUT`, a
+//!      fieldless enum variant, so `format!("{e:?}")` on it renders
+//!      exactly `"Timeout"`.
+//!    - `card-backend-pcsc` 0.5.2 (`src/lib.rs`, `PcscTransaction::transmit`,
+//!      line ~274): every `pcsc::Error` other than `NotTransacted` falls
+//!      through a catch-all arm, `SmartcardError::Error(format!("Transmit
+//!      failed: {e:?}"))` — so a real reader timeout surfaces as
+//!      `SmartcardError::Error("Transmit failed: Timeout")` specifically,
+//!      with no dedicated timeout variant to match on structurally.
+//!    - `openpgp-card` wraps that as
+//!      `Error::Smartcard(SmartcardError::Error(..))` (confirmed by
+//!      `testing.rs::tests::touch_timeout_surfaces_as_a_smartcard_error`,
+//!      which asserts exactly this against the fake).
+//!
+//!    That *same* catch-all arm is also what a genuinely different
+//!    transport fault at that same call site goes through — e.g. the card
+//!    being physically pulled, or the reader losing it, mid-signature
+//!    (`pcsc::Error::RemovedCard`/`NoSmartcard`/`ResetCard`, rendered as
+//!    `"Transmit failed: RemovedCard"` etc. by that same `{e:?}`
+//!    formatting) — and `SmartcardError::NotTransacted`
+//!    (`SCARD_E_NOT_TRANSACTED`, its own dedicated variant, not routed
+//!    through the string-formatted catch-all at all). Neither of these is
+//!    a touch timeout — retrying-and-tapping can't fix a card that's
+//!    physically gone — so `map_sign_error` maps them to
+//!    [`YubiError::CardNotFound`] instead (Finding I-1(a)), and only the
+//!    exact confirmed string `"Transmit failed: Timeout"` maps to
+//!    [`YubiError::TouchTimeout`] (deliberately an exact match, not a
+//!    substring/prefix one, so it can't accidentally also match the
+//!    `RemovedCard`/`NoSmartcard`/`ResetCard` shapes above). Any other
+//!    `Error::Smartcard(_)` shape this module doesn't otherwise recognize
+//!    falls through to the generic [`YubiError::Other`], preserving the
+//!    real underlying message, rather than being guessed at as a touch
+//!    timeout.
 //!
 //! [`YubiError::Other`]: crate::YubiError::Other
 //!
@@ -142,19 +155,35 @@
 //! present. Every `public_key()`/`card_serial()` call is a plain,
 //! infallible in-memory read (hence their non-`Result` signatures); every
 //! `sign()` call independently performs the full discover → open →
-//! verify-PIN → touch-gated-sign sequence against whatever card is
-//! physically present *at that moment*, and simply fails with
-//! [`YubiError::CardNotFound`] if none is. `YubiKeySigner` deliberately
-//! does **not** check that the freshly-discovered card's serial matches
-//! `self.card_serial` — that "wrong card inserted" binding check is
-//! `aivyx-federation`'s job (see [`YubiError::WrongCard`]'s own doc
-//! comment in `lib.rs`, "not constructed anywhere in this crate"), which
-//! this module respects by construction rather than duplicating.
+//! check-serial → verify-PIN → touch-gated-sign sequence against whatever
+//! card is physically present *at that moment*, and simply fails with
+//! [`YubiError::CardNotFound`] if none is present at all.
+//!
+//! `YubiKeySigner` DOES check that the freshly-discovered card's serial
+//! matches `self.card_serial` (Finding I-3) — immediately after opening a
+//! transaction and before presenting the User PIN or attempting to sign,
+//! the private `sign_with_open_card` reads the discovered card's serial
+//! and compares it against the one this signer was constructed against,
+//! returning [`YubiError::WrongCard`] on a mismatch rather than
+//! proceeding. This matters for two independent reasons: signing with the
+//! wrong card's key produces a signature that silently fails downstream
+//! verification with no diagnosable cause, and presenting the cached User
+//! PIN to a foreign card risks decrementing an unrelated card's PIN retry
+//! counter. This crate performs the check itself — rather than leaving it
+//! entirely to `aivyx-federation`, as an earlier version of this module's
+//! design intended — because it's cheap (the serial read already happens
+//! as part of every `sign()` call) and the failure mode it prevents is
+//! severe enough not to depend on every caller remembering to check it
+//! independently. `aivyx-federation`'s own binding record (Task 7) may
+//! still want its own check against a *persisted* expectation, which this
+//! crate has no concept of — this check only guards against the card
+//! changing out from under an already-constructed `YubiKeySigner`.
 //!
 //! [`YubiError::WrongCard`]: crate::YubiError::WrongCard
 
 #[cfg(test)]
-use card_backend::{CardBackend, SmartcardError};
+use card_backend::CardBackend;
+use card_backend::SmartcardError;
 use openpgp_card::{
     Card, Error as OpenpgpError,
     ocard::{
@@ -189,8 +218,8 @@ impl YubiKeySigner {
     /// Signature slot's already-provisioned public key.
     ///
     /// `user_pin` is kept in memory (not verified against the card yet —
-    /// reading the public key needs no PIN at all, see
-    /// [`from_open_card`][Self::from_open_card]) and re-presented fresh on
+    /// reading the public key needs no PIN at all, see this type's private
+    /// `from_open_card`) and re-presented fresh on
     /// every later [`Self::sign`] call. A wrong PIN is therefore only
     /// discovered on the first `sign()` call, not here — see this
     /// module's doc comment for why `sign()` always re-verifies rather
@@ -257,23 +286,39 @@ impl YubiKeySigner {
     ///
     /// Re-discovers and re-opens the physical card from scratch on every
     /// call rather than reusing any state from construction beyond the
-    /// cached PIN — see this module's doc comment for why.
+    /// cached PIN and serial — see this module's doc comment for why, and
+    /// for why the freshly-discovered card's serial is checked against
+    /// `self.card_serial` before anything else (Finding I-3).
     pub fn sign(&mut self, message: &[u8]) -> Result<[u8; 64], YubiError> {
         let card = discovery::discover_real_card()?;
-        Self::sign_with_open_card(card, &self.user_pin, message)
+        Self::sign_with_open_card(card, &self.card_serial, &self.user_pin, message)
     }
 
     /// The testable core of [`Self::sign`]: given an already-opened
-    /// `Card<Open>`, verifies the User PIN for signing and performs the
-    /// actual `PSO: COMPUTE DIGITAL SIGNATURE`, mapping every real
-    /// failure path to the matching [`YubiError`] variant. See this
-    /// module's doc comment for the grounding behind each mapping.
+    /// `Card<Open>`, checks its serial matches `expected_serial`, verifies
+    /// the User PIN for signing, and performs the actual `PSO: COMPUTE
+    /// DIGITAL SIGNATURE`, mapping every real failure path to the matching
+    /// [`YubiError`] variant. See this module's doc comment for the
+    /// grounding behind each mapping.
     fn sign_with_open_card(
         mut card: Card<Open>,
+        expected_serial: &str,
         user_pin: &SecretString,
         message: &[u8],
     ) -> Result<[u8; 64], YubiError> {
         let mut tx = card.transaction()?;
+
+        // Checked before presenting the PIN or attempting to sign: a
+        // different card being physically present than the one this
+        // signer was constructed against must neither sign with the wrong
+        // key nor present the cached PIN to a foreign card (Finding I-3).
+        let found_serial = discovery::read_serial(&mut tx)?;
+        if found_serial != expected_serial {
+            return Err(YubiError::WrongCard {
+                expected: expected_serial.to_string(),
+                found: found_serial,
+            });
+        }
 
         tx.verify_user_signing_pin(user_pin.clone())
             .map_err(map_signing_pin_error)?;
@@ -297,11 +342,12 @@ impl YubiKeySigner {
     #[cfg(test)]
     fn discover_and_sign(
         backends: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
+        expected_serial: &str,
         user_pin: &SecretString,
         message: &[u8],
     ) -> Result<[u8; 64], YubiError> {
         let card = discovery::discover_card_from(backends)?;
-        Self::sign_with_open_card(card, user_pin, message)
+        Self::sign_with_open_card(card, expected_serial, user_pin, message)
     }
 }
 
@@ -381,15 +427,39 @@ fn map_signing_pin_error(err: OpenpgpError) -> YubiError {
 }
 
 /// Map a `PSO: COMPUTE DIGITAL SIGNATURE` failure to the matching
-/// [`YubiError`], in particular upgrading any transport-level
-/// `Error::Smartcard(_)` to [`YubiError::TouchTimeout`] — see this
-/// module's doc comment for the full grounding and the honest limits of
-/// that mapping. Any other error shape (a card status word this crate
-/// doesn't otherwise special-case) falls through to the blanket
-/// `From<openpgp_card::Error>` impl.
+/// [`YubiError`], covering both real touch-timeout shapes
+/// ([`StatusBytes::ConditionOfUseNotSatisfied`] and the exact
+/// `"Transmit failed: Timeout"` transport string) while distinguishing
+/// them from "the card is physically gone" transport shapes that must NOT
+/// be reported as a touch timeout — see this module's doc comment for the
+/// full grounding (Finding I-1). Any other error shape (a card status
+/// word, or an unrecognized `Error::Smartcard(_)`, this crate doesn't
+/// otherwise special-case) falls through to the blanket
+/// `From<openpgp_card::Error>` impl, which maps it to [`YubiError::Other`]
+/// with the real underlying message preserved.
 fn map_sign_error(err: OpenpgpError) -> YubiError {
     match err {
-        OpenpgpError::Smartcard(_) => YubiError::TouchTimeout,
+        OpenpgpError::CardStatus(StatusBytes::ConditionOfUseNotSatisfied) => {
+            YubiError::TouchTimeout
+        }
+        OpenpgpError::Smartcard(SmartcardError::Error(ref msg))
+            if msg == "Transmit failed: Timeout" =>
+        {
+            YubiError::TouchTimeout
+        }
+        OpenpgpError::Smartcard(SmartcardError::Error(ref msg))
+            if matches!(
+                msg.as_str(),
+                "Transmit failed: RemovedCard"
+                    | "Transmit failed: NoSmartcard"
+                    | "Transmit failed: ResetCard"
+            ) =>
+        {
+            YubiError::CardNotFound(format!("card became unavailable mid-signature: {msg}"))
+        }
+        OpenpgpError::Smartcard(SmartcardError::NotTransacted) => YubiError::CardNotFound(
+            "card transaction failed (not transacted) — likely removed mid-signature".to_string(),
+        ),
         other => other.into(),
     }
 }
@@ -424,16 +494,46 @@ mod tests {
         provisioned_card_from(FakeCard::new())
     }
 
+    /// `FakeCard::new()`'s fixed manufacturer (0x0006, "Yubico AB") and
+    /// serial (0x00112233), rendered the same way `discovery::read_serial`
+    /// does — see `testing.rs` and `discovery.rs`'s own matching test.
+    const DEFAULT_SERIAL: &str = "0006:00112233";
+
     #[test]
     fn successful_sign_returns_the_fakes_fabricated_signature() {
         let card = provisioned_card();
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let signature = YubiKeySigner::sign_with_open_card(card, &user_pin, b"hello, aivyx")
-            .expect("signing should succeed against the fake");
+        let signature =
+            YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"hello, aivyx")
+                .expect("signing should succeed against the fake");
 
         assert_eq!(signature, FakeCard::fake_signature());
         assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn sign_sends_the_raw_message_unmodified_to_the_card() {
+        // Finding I-2: the single most load-bearing correctness claim in
+        // this module (no host-side hashing, the raw message is sent as
+        // the PSO:CDS data field unchanged) had zero regression
+        // protection. Record the fake's handle *before* moving it into
+        // `Card::new` (which boxes it with no handle retained -- see
+        // `testing.rs`'s doc comment, section 5).
+        let fake = FakeCard::new();
+        let last_signed_data = fake.last_signed_data_handle();
+        let card = provisioned_card_from(fake);
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+        let message = b"hello, aivyx";
+
+        YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, message)
+            .expect("signing should succeed against the fake");
+
+        assert_eq!(
+            last_signed_data.lock().unwrap().as_slice(),
+            message,
+            "the card should receive the raw message bytes unchanged, not a hash/digest"
+        );
     }
 
     #[test]
@@ -469,10 +569,43 @@ mod tests {
             vec![Ok(FakeCard::absent().into())];
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let err = YubiKeySigner::discover_and_sign(backends.into_iter(), &user_pin, b"message")
-            .expect_err("signing against an absent card should fail");
+        let err = YubiKeySigner::discover_and_sign(
+            backends.into_iter(),
+            DEFAULT_SERIAL,
+            &user_pin,
+            b"message",
+        )
+        .expect_err("signing against an absent card should fail");
 
         assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    #[test]
+    fn sign_rejects_a_different_card_than_the_one_constructed_against() {
+        // Finding I-3: cards were swapped between construction and this
+        // `sign()` call (or multiple cards are present) -- the freshly
+        // discovered card's serial doesn't match `self.card_serial`, so
+        // this must fail loudly rather than silently sign with the wrong
+        // key (or present the cached PIN to a foreign card).
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(FakeCard::new().with_serial(0x0099_9999).into())];
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+
+        let err = YubiKeySigner::discover_and_sign(
+            backends.into_iter(),
+            DEFAULT_SERIAL,
+            &user_pin,
+            b"message",
+        )
+        .expect_err("signing against a different card than constructed should fail");
+
+        match err {
+            YubiError::WrongCard { expected, found } => {
+                assert_eq!(expected, DEFAULT_SERIAL);
+                assert_eq!(found, "0006:00999999");
+            }
+            other => panic!("expected YubiError::WrongCard, got {other:?}"),
+        }
     }
 
     #[test]
@@ -480,7 +613,7 @@ mod tests {
         let card = provisioned_card_from(FakeCard::new().with_changed_user_pin(b"000000"));
         let wrong_pin = SecretString::from("999999");
 
-        let err = YubiKeySigner::sign_with_open_card(card, &wrong_pin, b"message")
+        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &wrong_pin, b"message")
             .expect_err("signing with the wrong PIN should fail");
 
         assert!(matches!(err, YubiError::PinIncorrect));
@@ -491,10 +624,29 @@ mod tests {
         let card = provisioned_card_from(FakeCard::new().with_touch_timeout());
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let err = YubiKeySigner::sign_with_open_card(card, &user_pin, b"message")
+        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
             .expect_err("a simulated touch timeout should fail signing");
 
         assert!(matches!(err, YubiError::TouchTimeout));
+    }
+
+    #[test]
+    fn card_removed_mid_signature_is_not_mapped_to_touch_timeout() {
+        // Finding I-1(a): a card physically removed mid-signature is a
+        // transport-level `Error::Smartcard(_)` too, same as a genuine
+        // touch timeout, but retrying-and-tapping can't fix it -- must NOT
+        // be reported as `TouchTimeout`.
+        let card = provisioned_card_from(FakeCard::new().with_card_removed_mid_signature());
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+
+        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
+            .expect_err("a simulated card removal should fail signing");
+
+        assert!(
+            !matches!(err, YubiError::TouchTimeout),
+            "a removed card must not be misreported as a touch timeout, got {err:?}"
+        );
+        assert!(matches!(err, YubiError::CardNotFound(_)));
     }
 
     #[test]
@@ -534,5 +686,56 @@ mod tests {
         )));
 
         assert!(matches!(err, YubiError::TouchTimeout));
+    }
+
+    #[test]
+    fn card_status_condition_of_use_not_satisfied_is_mapped_to_touch_timeout() {
+        // Finding I-1(b): the OpenPGP applet's own UIF touch-timeout
+        // status word (69 85), the structurally sound signal -- not
+        // just the transport-level approximation above.
+        let err = map_sign_error(OpenpgpError::CardStatus(
+            StatusBytes::ConditionOfUseNotSatisfied,
+        ));
+
+        assert!(matches!(err, YubiError::TouchTimeout));
+    }
+
+    #[test]
+    fn smartcard_removed_card_error_is_not_mapped_to_touch_timeout() {
+        // Finding I-1(a): same transport-level `Error::Smartcard(_)` shape
+        // as a real touch timeout, but a different, real `pcsc::Error`
+        // variant name -- must not be conflated with a touch timeout.
+        let err = map_sign_error(OpenpgpError::Smartcard(SmartcardError::Error(
+            "Transmit failed: RemovedCard".to_string(),
+        )));
+
+        assert!(!matches!(err, YubiError::TouchTimeout));
+        assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    #[test]
+    fn smartcard_not_transacted_error_is_not_mapped_to_touch_timeout() {
+        // Finding I-1(a): `SmartcardError::NotTransacted` is its own
+        // dedicated variant (not routed through the string-formatted
+        // catch-all at all) -- also not a touch timeout.
+        let err = map_sign_error(OpenpgpError::Smartcard(SmartcardError::NotTransacted));
+
+        assert!(!matches!(err, YubiError::TouchTimeout));
+        assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    #[test]
+    fn an_unrecognized_smartcard_error_falls_back_to_other() {
+        // Anything this module doesn't specifically recognize must not be
+        // guessed at as a touch timeout either -- confirms the honest
+        // fallback the doc comment promises.
+        let err = map_sign_error(OpenpgpError::Smartcard(SmartcardError::Error(
+            "Transmit failed: SomeOtherPcscFault".to_string(),
+        )));
+
+        match err {
+            YubiError::Other(msg) => assert!(msg.contains("SomeOtherPcscFault")),
+            other => panic!("expected YubiError::Other, got {other:?}"),
+        }
     }
 }

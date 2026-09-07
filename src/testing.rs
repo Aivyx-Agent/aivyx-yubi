@@ -214,6 +214,8 @@
 //!   left as a known limitation for a later task to pick up if it turns
 //!   out to be needed, rather than speculatively adding now.
 
+use std::sync::{Arc, Mutex};
+
 use card_backend::{
     CardBackend, CardCaps, CardTransaction, PinType as BackendPinType, SmartcardError,
 };
@@ -498,6 +500,8 @@ pub struct FakeCard {
     algo_sig: Vec<u8>,
     signing_key_generated: bool,
     touch_timeout: bool,
+    /// See [`Self::with_card_removed_mid_signature`].
+    card_removed_mid_signature: bool,
     /// PW1 (signing mode, VERIFY P2 `0x81`) has been successfully
     /// verified in the current session. Gates `PSO: COMPUTE DIGITAL
     /// SIGNATURE`. See this module's doc comment, section 5.
@@ -506,6 +510,16 @@ pub struct FakeCard {
     /// the current session. Gates `GENERATE ASYMMETRIC KEY PAIR`. See
     /// this module's doc comment, section 5.
     verified_pw3_admin: bool,
+    /// The exact data field of the last `PSO: COMPUTE DIGITAL SIGNATURE`
+    /// this fake received, if any. Shared via `Arc<Mutex<..>>` (rather
+    /// than a plain field) so a test can keep a cheap clone of the handle
+    /// — via [`Self::last_signed_data_handle`] — *before* moving this fake
+    /// into `Card::new` (which boxes it with no handle retained, see this
+    /// module's doc comment, section 5) and still inspect it afterward.
+    /// Exists to prove the real signing code path (`sign.rs`) sends the
+    /// raw message unmodified, not a hash or digest — see this module's
+    /// doc comment, "Finding I-2".
+    last_signed_data: Arc<Mutex<Vec<u8>>>,
 }
 
 impl FakeCard {
@@ -524,8 +538,10 @@ impl FakeCard {
             algo_sig: ALGO_ATTRS_RSA2048.to_vec(),
             signing_key_generated: false,
             touch_timeout: false,
+            card_removed_mid_signature: false,
             verified_pw1_sign: false,
             verified_pw3_admin: false,
+            last_signed_data: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -573,10 +589,34 @@ impl FakeCard {
 
     /// Simulate a reader that times out waiting for the touch confirmation
     /// a `PSO: COMPUTE DIGITAL SIGNATURE` needs: `transmit()` itself fails
-    /// (see this module's doc comment point 5), rather than the card
-    /// returning any status word.
+    /// with the real string shape `card-backend-pcsc` produces for a
+    /// genuine `pcsc::Error::Timeout` (`"Transmit failed: Timeout"`,
+    /// confirmed against `card-backend-pcsc-0.5.2/src/lib.rs`'s
+    /// `PcscTransaction::transmit` — see `sign.rs`'s doc comment), rather
+    /// than the card returning any status word.
     pub fn with_touch_timeout(mut self) -> Self {
         self.touch_timeout = true;
+        self
+    }
+
+    /// Simulate the card being physically removed (or the reader losing
+    /// it) mid-signature: `transmit()` fails with the real string shape
+    /// `card-backend-pcsc` produces for `pcsc::Error::RemovedCard`
+    /// (`"Transmit failed: RemovedCard"`, same call site and formatting as
+    /// [`Self::with_touch_timeout`]'s `Timeout` case). Added for Finding
+    /// I-1(a): this must NOT be mapped to `YubiError::TouchTimeout` by
+    /// `sign::map_sign_error`, unlike the touch-timeout fixture above.
+    pub fn with_card_removed_mid_signature(mut self) -> Self {
+        self.card_removed_mid_signature = true;
+        self
+    }
+
+    /// Override this card's serial (keeping the fixed Yubico manufacturer
+    /// id). Fake-only setup helper for simulating a *different* physical
+    /// card than the one a `YubiKeySigner` was originally constructed
+    /// against — see `sign.rs`'s Finding I-3 tests.
+    pub fn with_serial(mut self, serial: u32) -> Self {
+        self.serial = serial;
         self
     }
 
@@ -607,6 +647,15 @@ impl FakeCard {
     /// SIGNATURE` returns. See [`Self::fake_public_key`].
     pub fn fake_signature() -> [u8; 64] {
         FAKE_ED25519_SIGNATURE
+    }
+
+    /// A cheap clone of the shared handle recording the exact data field
+    /// of the last `PSO: COMPUTE DIGITAL SIGNATURE` this fake received.
+    /// Call this *before* moving the fake into `Card::new` (which boxes it
+    /// with no handle retained — see this module's doc comment, section
+    /// 5) to still be able to inspect it afterward.
+    pub fn last_signed_data_handle(&self) -> Arc<Mutex<Vec<u8>>> {
+        Arc::clone(&self.last_signed_data)
     }
 }
 
@@ -816,10 +865,34 @@ impl CardTransaction for FakeCardTransaction<'_> {
                     return Ok(vec![0x69, 0x82]);
                 }
                 if self.card.touch_timeout {
+                    // Real string shape confirmed against
+                    // `card-backend-pcsc-0.5.2`'s `PcscTransaction::transmit`
+                    // (~line 274): every `pcsc::Error` other than
+                    // `NotTransacted` becomes `SmartcardError::Error(format!(
+                    // "Transmit failed: {e:?}"))`, and `pcsc::Error::Timeout`'s
+                    // fieldless `Debug` renders exactly `"Timeout"` — see
+                    // `sign.rs`'s doc comment.
                     return Err(SmartcardError::Error(
-                        "reader timed out waiting for touch confirmation".to_string(),
+                        "Transmit failed: Timeout".to_string(),
                     ));
                 }
+                if self.card.card_removed_mid_signature {
+                    // Same transport call site and formatting as the touch
+                    // timeout above, but `pcsc::Error::RemovedCard`'s own
+                    // variant name — a genuinely different transport fault
+                    // that must not be conflated with a touch timeout
+                    // (Finding I-1(a)).
+                    return Err(SmartcardError::Error(
+                        "Transmit failed: RemovedCard".to_string(),
+                    ));
+                }
+                // Record the exact data field this command carried, so a
+                // test can prove the real signing code path sends the raw
+                // message unmodified, not a hash/digest (Finding I-2).
+                // Short-form Lc only, same caveat as the VERIFY arm above.
+                let lc = cmd.get(4).copied().unwrap_or(0) as usize;
+                let data = cmd.get(5..5 + lc).unwrap_or(&[]).to_vec();
+                *self.card.last_signed_data.lock().unwrap() = data;
                 Ok(ok(FAKE_ED25519_SIGNATURE.to_vec()))
             }
 
