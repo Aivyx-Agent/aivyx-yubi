@@ -47,3 +47,15 @@ documented follow-up, not something this crate's own CI/tests can prove.
 - No test in this crate's own suite exercises real hardware — a real
   physical touch, a real PIN prompt, or real on-card key generation
   against actual silicon. All tests run against a fake card backend.
+- `YubiKeySigner` caches the User PIN (`secrecy::SecretString`) in
+  process memory for its entire lifetime, re-presenting it to the card
+  fresh on every `sign()` call — but the operator is only re-touched, not
+  re-prompted for the PIN, after construction (see `sign.rs`'s own
+  rustdoc). This is a **deliberate deviation** from the design spec's
+  original `Identity::load_hardware(instance_id, binding_record)` sketch
+  (`docs/superpowers/specs/2026-09-07-aivyx-yubi-design.md`), which took
+  no PIN parameter at all and implied a prompt-capable flow. Any consumer
+  (e.g. a future `aivyx-federation` integration) needs to explicitly
+  decide where/how a long-running daemon obtains and retains this PIN at
+  startup — this crate does not solve that problem, it only documents
+  that the problem exists.

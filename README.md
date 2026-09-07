@@ -36,6 +36,12 @@ for the full account.
   well-known factory default (`123456`).
 - Signs arbitrary byte messages, returning a raw 64-byte Ed25519
   signature.
+- Caches the User PIN in process memory for a `YubiKeySigner`'s entire
+  lifetime (re-presented to the card on every signature, but the operator
+  is only re-touched, not re-prompted for the PIN, after construction) —
+  see `CLAUDE.md`'s "Known, deliberately-undefended limitations" for why
+  this is a deliberate deviation from the design spec worth a consumer's
+  explicit attention.
 - Has **no knowledge of Aivyx's federation protocol** or any other
   product concept — `aivyx-federation`'s `Identity` is the consumer that
   gives this primitive meaning.

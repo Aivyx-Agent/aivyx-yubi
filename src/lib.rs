@@ -2,8 +2,6 @@
 //! OpenPGP card applet. See `docs/superpowers/specs/
 //! 2026-09-07-aivyx-yubi-design.md` for the full design rationale.
 
-pub use openpgp_card::Card;
-
 pub mod discovery;
 pub mod pin;
 pub mod provision;
@@ -15,6 +13,15 @@ pub mod sign;
 // caller shouldn't need to know `YubiKeySigner` happens to live in a
 // `sign` submodule to reach it.
 pub use sign::YubiKeySigner;
+
+// Re-exported so a consumer of `YubiKeySigner::new(user_pin: SecretString)`
+// (e.g. a future CLI in a different repo) gets the exact `secrecy` type
+// this crate's public API expects for free, rather than needing to add
+// their own `secrecy` dependency independently pinned to a version
+// compatible with what `openpgp-card` 0.7.0 actually uses internally
+// (discoverable otherwise only by reading this crate's own `Cargo.toml`)
+// (Finding M-5).
+pub use secrecy::SecretString;
 
 /// Fake `CardBackend`/`CardTransaction` test double standing in for real
 /// YubiKey hardware. See the module's own doc comment for how it was
@@ -133,6 +140,29 @@ pub enum YubiError {
          verify the Admin PIN (e.g. via `Card<Transaction>::as_admin_card`) before retrying"
     )]
     AdminAuthRequired,
+
+    /// The Signature slot's touch-policy is not `Fixed` (physical-touch
+    /// confirmation required on every signature) — this crate's entire
+    /// reason to exist, checked and enforced at signing time rather than
+    /// merely assumed from provisioning having (hopefully) run once.
+    /// Returned by `sign::YubiKeySigner::sign`'s private
+    /// `sign_with_open_card`, which reads back the Signature slot's live
+    /// touch policy (`Card<Transaction>::user_interaction_flag`) on every
+    /// call, immediately after the card-serial check and before
+    /// presenting the PIN or attempting to sign — see `sign.rs`'s own doc
+    /// comment (Finding I-1) for the full grounding and the concrete
+    /// failure scenarios this closes (interrupted/failed provisioning, a
+    /// key created by other tooling with touch disabled, an
+    /// `UnsupportedFeature` card, ...). Never proceed to sign without this
+    /// check passing — a silent downgrade to a touch-less, PIN-only
+    /// signature is exactly the "weaker guarantee" this crate's design
+    /// spec forbids.
+    #[error(
+        "the Signature slot's touch policy is not set to Fixed (physical touch confirmation) — \
+         refusing to sign without touch enforcement; run provisioning \
+         (`provision::set_signature_touch_policy_fixed`) against this card first"
+    )]
+    TouchPolicyNotEnforced,
 
     /// Catch-all for every other real error this crate's dependencies can
     /// report (raw APDU status words not covered above, transport

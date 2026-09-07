@@ -29,7 +29,8 @@
 //! different failure shapes: the former surfaces as an *empty* iterator
 //! (this module's job to turn into a clear [`YubiError::CardNotFound`]),
 //! the latter as the outer `Result::Err` (mapped by
-//! [`map_enumeration_error`]).
+//! `map_enumeration_error`, a private function — see this file's own
+//! source, not doc-linkable).
 //!
 //! [`discover_card_from`]'s enumeration-level filtering matches the real
 //! crate's own `Card::<Open>::open_by_ident` (`openpgp-card-0.7.0/src/
@@ -64,8 +65,9 @@
 //! "Real hardware verification" note and this crate's own `CLAUDE.md`.
 //! [`discover_card_from`] carries the real, tested selection logic; this
 //! function is a thin, hand-verified wrapper around it plus the one
-//! enumeration-error mapping ([`map_enumeration_error`]) that only the
-//! real `card_backends()` call can exercise.
+//! enumeration-error mapping (`map_enumeration_error`, a private function
+//! — see this file's own source, not doc-linkable) that only the real
+//! `card_backends()` call can exercise.
 
 use card_backend::{CardBackend, SmartcardError};
 use card_backend_pcsc::PcscBackend;

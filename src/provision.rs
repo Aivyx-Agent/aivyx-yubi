@@ -77,7 +77,8 @@
 //!
 //! `generate_key`'s `fp_from_pub` callback computes the [`Fingerprint`]
 //! the card stores on-card (GET DATA tag `C5`) alongside the new key —
-//! see [`key_slot_fingerprint`]'s own doc comment for why this crate uses
+//! see `key_slot_fingerprint`'s own doc comment (a private function — see
+//! this file's own source, not doc-linkable) for why this crate uses
 //! a simple, explicitly-non-spec-compliant placeholder rather than a real
 //! RFC 4880 §12.2 fingerprint.
 //!
@@ -114,7 +115,8 @@
 //! and still returns `Ok(Card<Admin>)`, i.e. the typestate alone does
 //! *not* guarantee PW3 was actually verified; only the card's own
 //! `6982`-on-write response does. Both real-card `6982` responses are
-//! mapped by [`map_admin_op_error`] to [`YubiError::AdminAuthRequired`]
+//! mapped by `map_admin_op_error` (a private function — see this file's
+//! own source, not doc-linkable) to [`YubiError::AdminAuthRequired`]
 //! rather than the generic [`YubiError::Other`] fallback.
 
 use openpgp_card::{

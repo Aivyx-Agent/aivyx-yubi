@@ -9,7 +9,6 @@ license = "MIT OR Apache-2.0"
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 thiserror = "2"
-tracing = "0.1.44"
 # Needed directly (not just transitively via openpgp-card) because
 # `openpgp_card::card_backend::{CardBackend, CardTransaction}` doesn't
 # exist: those traits live in the separate `card-backend` crate and

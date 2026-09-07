@@ -118,6 +118,28 @@ pub fn is_pin_factory_default(tx: &mut Card<Transaction<'_>>) -> Result<bool, Yu
 /// [`YubiError::PinStillFactoryDefault`] instead of `Ok(true)` — the
 /// entry point provisioning flows should call, per this crate's design
 /// constraint: refuse to proceed on a factory-default PIN.
+///
+/// # Call this once per provisioning attempt — never in a retry loop (Finding I-3)
+///
+/// Each call VERIFYs the well-known default against **both** PW1 (User)
+/// and PW3 (Admin) — see [`is_pin_factory_default`]'s and this module's
+/// doc comment. On a card where both PINs have already been properly
+/// changed (the normal, desired state), that means one call to this
+/// function already burns one retry attempt off *each* PIN's limited
+/// counter (typically 3 total on real hardware) — even though the PIN
+/// really is fine. If an operator then *also* mistypes the real Admin PIN
+/// later in the same provisioning attempt, that's a second retry burned
+/// on PW3 in the same session — two mistakes, not three, can permanently
+/// block the Admin PIN, which has **no** admin-PIN-based recovery (only a
+/// rarely-configured Reset Code or a full TERMINATE+ACTIVATE card wipe;
+/// see [`YubiError::PinBlocked`]'s Admin case). A CLI provisioning flow
+/// (Task 8, not yet started as of this writing) must call this function
+/// **exactly once per provisioning attempt** — not on every operator
+/// retry of a failed command, and not both before *and* after prompting
+/// for the real Admin PIN — or it risks contributing to exactly the
+/// lockout it exists to prevent.
+///
+/// [`YubiError::PinBlocked`]: crate::YubiError::PinBlocked
 pub fn require_pin_changed(tx: &mut Card<Transaction<'_>>) -> Result<(), YubiError> {
     if is_pin_factory_default(tx)? {
         return Err(YubiError::PinStillFactoryDefault);

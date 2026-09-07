@@ -49,11 +49,45 @@
 //! harmless — the fake models this too: `PinSlot::verify` re-validates
 //! and resets `retries_left` to 3 on a correct PIN, it doesn't reject a
 //! second correct VERIFY). Touch confirmation (this crate's design-spec
-//! requirement, enforced by `provision::set_signature_touch_policy_fixed`
-//! setting `TouchPolicy::Fixed` on the card itself) is a wholly separate
-//! gate the card applies at the `PSO:CDS` step regardless of PW1 state —
-//! nothing in this module needs to special-case it beyond mapping the
-//! transport-level failure it produces (see below).
+//! requirement, nominally established once by
+//! `provision::set_signature_touch_policy_fixed` setting
+//! `TouchPolicy::Fixed` on the card itself) is a wholly separate gate the
+//! card applies at the `PSO:CDS` step regardless of PW1 state — but see
+//! the next section: this module does *not* simply trust that
+//! provisioning ran and stuck. It reads the policy back and checks it on
+//! every call, in addition to mapping the transport-level failure a touch
+//! timeout produces (see below).
+//!
+//! # Grounding: verifying the touch policy is actually enforced (Finding I-1)
+//!
+//! This crate's entire reason to exist is "every signature requires a
+//! physical touch". Trusting that guarantee purely because
+//! `provision::set_signature_touch_policy_fixed` was *supposed* to have
+//! run at some point in the past is not good enough: that call can fail
+//! partway through a provisioning attempt (card unplugged, operator
+//! Ctrl-C), silently no-op on hardware whose Extended Capabilities report
+//! algorithm/touch-policy attributes as unchangeable, or simply never run
+//! at all if an operator points this crate at a card whose Signature slot
+//! already holds a key created by other tooling with touch off. Any of
+//! those would otherwise let [`YubiKeySigner::sign`] succeed forever,
+//! silently, with zero physical confirmation — exactly the "silent
+//! downgrade to a weaker guarantee" this crate's design spec forbids.
+//!
+//! So `sign_with_open_card` reads the Signature slot's *live* touch
+//! policy back from the card on every call, via the real, public
+//! `Card<Transaction>::user_interaction_flag(KeyType::Signing) ->
+//! Result<Option<UserInteractionFlag>, Error>` (confirmed directly against
+//! `openpgp-card-0.7.0/src/lib.rs` ~553-562; `provision.rs`'s own
+//! `sets_the_signature_touch_policy_to_fixed` test already uses exactly
+//! this call against the fake, proving it works end to end). `None` (the
+//! card reports no UIF at all for this slot) and any policy other than
+//! `TouchPolicy::Fixed` are both treated as "touch is not enforced" and
+//! rejected via [`YubiError::TouchPolicyNotEnforced`] — checked
+//! immediately after the card-serial check and before presenting the PIN
+//! or attempting to sign, so neither the PIN nor a real signature is ever
+//! produced against a touch-disabled Signature slot.
+//!
+//! [`YubiError::TouchPolicyNotEnforced`]: crate::YubiError::TouchPolicyNotEnforced
 //!
 //! # Grounding: detecting a touch timeout
 //!
@@ -187,8 +221,9 @@ use card_backend::SmartcardError;
 use openpgp_card::{
     Card, Error as OpenpgpError,
     ocard::{
-        StatusBytes,
+        KeyType, StatusBytes,
         crypto::{PublicKeyMaterial, SigningAlgo},
+        data::TouchPolicy,
     },
     state::Open,
 };
@@ -289,7 +324,21 @@ impl YubiKeySigner {
     /// cached PIN and serial — see this module's doc comment for why, and
     /// for why the freshly-discovered card's serial is checked against
     /// `self.card_serial` before anything else (Finding I-3).
-    pub fn sign(&mut self, message: &[u8]) -> Result<[u8; 64], YubiError> {
+    ///
+    /// Takes `&self`, not `&mut self` (Finding I-2): nothing this method
+    /// touches — `self.card_serial`, `self.user_pin` — is mutated; every
+    /// call re-discovers its own card session from scratch (see this
+    /// module's doc comment) rather than mutating any shared state. This
+    /// matters beyond tidiness: `aivyx-federation`'s `Identity::
+    /// sign_request` (this crate's intended caller, Task 7, not yet
+    /// started) can legitimately block for seconds on a physical touch,
+    /// and a `&mut self` signature here would force that caller to hold
+    /// `&mut Identity` across an `.await` that can block that long — in
+    /// practice meaning a whole daemon would need a `Mutex<Identity>` and
+    /// would serialize all federation signing. `&self` keeps that door
+    /// open for free while nothing in this workspace yet calls `sign()`
+    /// in production.
+    pub fn sign(&self, message: &[u8]) -> Result<[u8; 64], YubiError> {
         let card = discovery::discover_real_card()?;
         Self::sign_with_open_card(card, &self.card_serial, &self.user_pin, message)
     }
@@ -319,6 +368,14 @@ impl YubiKeySigner {
                 found: found_serial,
             });
         }
+
+        // Checked before presenting the PIN or attempting to sign: this
+        // crate's entire reason to exist is a physical touch confirmation
+        // on every signature, and that must never be assumed just because
+        // provisioning was supposed to have set it once — see this
+        // module's doc comment (Finding I-1) for the concrete ways that
+        // assumption can be wrong.
+        require_touch_policy_fixed(&mut tx)?;
 
         tx.verify_user_signing_pin(user_pin.clone())
             .map_err(map_signing_pin_error)?;
@@ -351,6 +408,30 @@ impl YubiKeySigner {
     }
 }
 
+/// Confirm the Signature slot's *live* touch policy is `Fixed` (physical
+/// touch confirmation required on every `PSO: COMPUTE DIGITAL SIGNATURE`),
+/// refusing with [`YubiError::TouchPolicyNotEnforced`] if not — see this
+/// module's doc comment (Finding I-1) for why this is checked fresh on
+/// every `sign()` call rather than trusted from provisioning having run
+/// once.
+///
+/// `Card<Transaction>::user_interaction_flag` needs no PIN verification —
+/// like `public_key_material`, it's a plain read-back of already-cached
+/// Application Related Data, not a PIN- or Admin-gated operation.
+/// `Ok(None)` (the card reports no UIF at all for this slot — e.g. a card
+/// that doesn't support touch confirmation) is treated the same as any
+/// non-`Fixed` policy: touch is not enforced, so signing is refused.
+fn require_touch_policy_fixed(
+    tx: &mut Card<openpgp_card::state::Transaction<'_>>,
+) -> Result<(), YubiError> {
+    let uif = tx.user_interaction_flag(KeyType::Signing)?;
+    let is_fixed = matches!(&uif, Some(flag) if flag.touch_policy() == TouchPolicy::Fixed);
+    if !is_fixed {
+        return Err(YubiError::TouchPolicyNotEnforced);
+    }
+    Ok(())
+}
+
 /// Read the Signature slot's current public key and validate it's
 /// actually an Ed25519 point, mirroring the same real-API-grounded check
 /// `provision::generate_signature_key` performs on its own `generate_key`
@@ -372,7 +453,6 @@ fn read_signature_public_key(
     tx: &mut Card<openpgp_card::state::Transaction<'_>>,
 ) -> Result<[u8; 32], YubiError> {
     use openpgp_card::ocard::{
-        KeyType,
         algorithm::{AlgorithmAttributes, Curve},
         crypto::EccType,
     };
@@ -472,11 +552,50 @@ mod tests {
     use crate::{pin, provision, testing::FakeCard};
 
     /// Build a [`Card<Open>`] wrapping `fake`, already admin-provisioned
-    /// with a generated Ed25519 Signature-slot key (mirroring
-    /// `provision.rs`'s own test setup) — the starting point every
+    /// with a generated Ed25519 Signature-slot key *and* the Signature
+    /// slot's touch policy set to `Fixed` (mirroring `provision.rs`'s own
+    /// test setup, plus the touch-policy step Finding I-1 requires every
+    /// genuinely-provisioned card to have) — the starting point every
     /// signing test below needs, since `YubiKeySigner` only ever *reads*
     /// an existing key, it never generates one.
+    ///
+    /// Setting the touch policy here (not just generating the key) matters
+    /// as of Finding I-1: `sign_with_open_card` now refuses to sign
+    /// against a card whose Signature slot doesn't report `Fixed`, and
+    /// `FakeCard::new()`'s own default touch policy is `Off` — without this
+    /// step, every test using this helper would fail with
+    /// [`YubiError::TouchPolicyNotEnforced`] before ever reaching whatever
+    /// it's actually trying to exercise. See
+    /// [`provisioned_card_with_touch_off`] for the one test that
+    /// deliberately wants the un-enforced case.
     fn provisioned_card_from(fake: FakeCard) -> Card<Open> {
+        let mut card = Card::new(fake).expect("Card::new should succeed against the fake");
+        {
+            let mut tx = card.transaction().expect("transaction should start");
+            let admin_pin = SecretString::from(pin::FACTORY_DEFAULT_ADMIN_PIN);
+            let mut admin = tx
+                .as_admin_card(admin_pin)
+                .expect("admin PIN should verify against the fake's factory-default PW3");
+            provision::generate_signature_key(&mut admin)
+                .expect("key generation should succeed against the fake");
+            provision::set_signature_touch_policy_fixed(&mut admin)
+                .expect("touch policy should be settable against the fake");
+        }
+        card
+    }
+
+    fn provisioned_card() -> Card<Open> {
+        provisioned_card_from(FakeCard::new())
+    }
+
+    /// Same as [`provisioned_card_from`], but deliberately does NOT set
+    /// the Signature slot's touch policy to `Fixed` — leaves it at
+    /// `FakeCard::new()`'s own default, `Off`. Used only by
+    /// [`sign_refuses_when_the_signature_slots_touch_policy_is_not_fixed`]
+    /// (Finding I-1) to prove `sign_with_open_card` refuses to sign
+    /// against a touch-disabled Signature slot rather than silently
+    /// succeeding.
+    fn provisioned_card_with_touch_off(fake: FakeCard) -> Card<Open> {
         let mut card = Card::new(fake).expect("Card::new should succeed against the fake");
         {
             let mut tx = card.transaction().expect("transaction should start");
@@ -488,10 +607,6 @@ mod tests {
                 .expect("key generation should succeed against the fake");
         }
         card
-    }
-
-    fn provisioned_card() -> Card<Open> {
-        provisioned_card_from(FakeCard::new())
     }
 
     /// `FakeCard::new()`'s fixed manufacturer (0x0006, "Yubico AB") and
@@ -510,6 +625,26 @@ mod tests {
 
         assert_eq!(signature, FakeCard::fake_signature());
         assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn sign_refuses_when_the_signature_slots_touch_policy_is_not_fixed() {
+        // Finding I-1: this crate's entire reason to exist is a physical
+        // touch gate on every signature. A card whose Signature slot was
+        // provisioned (key generated) but never had its touch policy set
+        // to `Fixed` -- `FakeCard::new()`'s own default -- must never be
+        // signed against; touch enforcement is verified fresh at signing
+        // time, not just assumed from provisioning having run once.
+        let card = provisioned_card_with_touch_off(FakeCard::new());
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+
+        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
+            .expect_err("signing against a touch-disabled Signature slot must be refused");
+
+        assert!(
+            matches!(err, YubiError::TouchPolicyNotEnforced),
+            "expected YubiError::TouchPolicyNotEnforced, got {err:?}"
+        );
     }
 
     #[test]
