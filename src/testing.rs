@@ -176,10 +176,17 @@
 //!   from the failed `VERIFY` itself (`StatusBytes::PasswordNotChecked(n)`,
 //!   real enum, real mapping — see point 4), not on `pw_status_bytes()`.
 //! - **Touch timeout** is modeled as a *transport*-level failure (`Err(
-//!   SmartcardError::Error(..))` from `transmit()`), not a card status
-//!   word. This matches reality: a PC/SC reader that times out waiting for
-//!   a physical touch fails the transmit itself; the OpenPGP card never
-//!   gets to send a status word at all.
+//!   SmartcardError::Error(..))` from `transmit()`), matching one of the
+//!   two real shapes a touch timeout can plausibly take — a PC/SC reader
+//!   that times out waiting for a physical touch failing the transmit
+//!   itself. This fake does **not** currently also model the other real
+//!   shape: the card's own internal touch window expiring and returning
+//!   `StatusBytes::ConditionOfUseNotSatisfied` (`0x69 0x85`) as a normal
+//!   status word. `sign.rs`'s `map_sign_error` handles both shapes on the
+//!   real-code side (see its own doc comment for the grounding), but only
+//!   the transport-level shape is exercised by this fake today — a real
+//!   YubiKey may in practice surface the status-word shape instead, or as
+//!   well, which this fake's own tests can't currently prove either way.
 //! - **Card absent/unreachable** is modeled at `CardBackend::transaction()`
 //!   (`Err(SmartcardError::CardNotFound(..))`), matching where
 //!   `card-backend-pcsc` itself would surface that failure (see
