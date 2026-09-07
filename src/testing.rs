@@ -142,10 +142,18 @@
 //! (`ocard/tlv.rs`, `test_tlv_yubi5`) and in `ocard/data/extended_cap.rs`'s
 //! `test_yk5`. AID manufacturer id `0x0006` ("Yubico AB") and version
 //! `0x0304` (card spec v3.4) are taken from that real fixture; the
-//! Algorithm Attributes for the Signature slot are deliberately set to
-//! EdDSA/Ed25519 (`ocard/algorithm.rs`'s `ecc_algo_attrs`: algo id `0x16` +
-//! `ocard/oid.rs`'s `ED25519` OID bytes) rather than the fixture's original
-//! RSA, since Ed25519-only signing is this crate's actual design target.
+//! Algorithm Attributes for the Signature slot ([`FakeCard::algo_sig`])
+//! *start* at RSA2048 (the same fixture bytes used for the
+//! Decryption/Authentication slots, `C2`/`C3` — real factory-fresh
+//! hardware defaults every slot to RSA2048, not Ed25519/EdDSA) and only
+//! become EdDSA/Ed25519 (`ocard/algorithm.rs`'s `ecc_algo_attrs`: algo id
+//! `0x16` + `ocard/oid.rs`'s `ED25519` OID bytes) once a real `PUT DATA`
+//! write to tag `C1` actually lands — see [`FakeCardTransaction::transmit`]'s
+//! `ins::PUT_DATA` arm. This is deliberate, not incidental: an
+//! unconditionally-Ed25519 fixture cannot distinguish "the caller
+//! configured the algorithm" from "the caller forgot to" (see
+//! `provision.rs`'s doc comment, "Real finding" section, for the
+//! regression this closes).
 //!
 //! ## 5. Design choices that are *not* real protocol, and are fake-only
 //!
@@ -248,6 +256,27 @@ pub const FACTORY_DEFAULT_ADMIN_PIN: &[u8] = b"12345678";
 /// against.
 const FAKE_ED25519_PUBLIC_KEY: [u8; 32] = [0xAB; 32];
 
+/// A fabricated 2048-bit RSA modulus/exponent pair, returned by a
+/// successful `GENERATE ASYMMETRIC KEY PAIR` for as long as the Signature
+/// slot's algorithm attribute is (still, or again) RSA2048 — i.e. before
+/// [`FakeCard::algo_sig`] has ever been reconfigured to Ed25519 via `PUT
+/// DATA`, mirroring a factory-fresh card. Not a real RSA key — just fixed,
+/// recognizable byte patterns; `len_e` (17 bits, matching
+/// [`ALGO_ATTRS_RSA2048`]) only constrains `FAKE_RSA_EXPONENT`'s bit
+/// width, not its actual value.
+const FAKE_RSA_MODULUS: [u8; 256] = [0xAA; 256];
+const FAKE_RSA_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
+
+/// The RSA2048 algorithm-attribute DO bytes a factory-fresh YubiKey 5
+/// reports for every key slot before any `set_algorithm`/`PUT DATA`
+/// configures it otherwise (`ocard/data/algo_attrs.rs::parse_rsa`: algo id
+/// `0x01` + be_u16 modulus-bit-length + be_u16 exponent-bit-length + import
+/// format). Used both as [`FakeCard::new`]'s initial Signature-slot
+/// algorithm attribute ([`FakeCard::algo_sig`]) and, unconditionally, for
+/// the Decryption/Authentication slots (`C2`/`C3`) this crate never
+/// touches.
+const ALGO_ATTRS_RSA2048: [u8; 6] = [0x01, 0x08, 0x00, 0x00, 0x11, 0x00];
+
 /// A fabricated Ed25519 signature (64 bytes, the real signature length),
 /// returned by a successful `PSO: COMPUTE DIGITAL SIGNATURE`.
 const FAKE_ED25519_SIGNATURE: [u8; 64] = [0xCD; 64];
@@ -292,7 +321,12 @@ fn ok(mut data: Vec<u8>) -> Vec<u8> {
 /// inside the real card's `73` "Discretionary Data Objects" wrapper — a
 /// flat list of the same tags is indistinguishable to any caller that only
 /// ever looks things up by tag.
-fn build_application_related_data(manufacturer: u16, serial: u32, uif_sig: [u8; 2]) -> Vec<u8> {
+fn build_application_related_data(
+    manufacturer: u16,
+    serial: u32,
+    uif_sig: [u8; 2],
+    algo_sig: &[u8],
+) -> Vec<u8> {
     // Application Identifier (tag 4F). Layout grounded in
     // `ocard/data/application_id.rs::parse`: `d2 76 00 01 24` fixed prefix,
     // 1-byte application id, be_u16 version, be_u16 manufacturer, be_u32
@@ -307,16 +341,14 @@ fn build_application_related_data(manufacturer: u16, serial: u32, uif_sig: [u8; 
     // output, `ocard/data/extended_cap.rs::test_yk5`.
     let ext_caps = [0x7d, 0x00, 0x0b, 0xfe, 0x08, 0x00, 0x00, 0xff, 0x00, 0x00];
 
-    // Algorithm Attributes, Signature slot (tag C1): EdDSA (algo id 0x16,
-    // `ocard/algorithm.rs::ecc_algo_attrs`) + the real Ed25519 OID bytes
-    // from `ocard/oid.rs::ED25519`.
-    let mut algo_sig = vec![0x16];
-    algo_sig.extend_from_slice(&[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01]);
+    // Algorithm Attributes, Signature slot (tag C1): reflects the fake's
+    // *current* live state (`FakeCard::algo_sig`), not a fixed value —
+    // see this module's doc comment, section 4, for why.
 
     // Algorithm Attributes, Decryption/Authentication slots (C2/C3): left
     // as RSA 2048 (real fixture bytes) — this crate doesn't touch these
     // slots, but a well-formed card has *some* algorithm set for them.
-    let algo_other = [0x01, 0x08, 0x00, 0x00, 0x11, 0x00];
+    let algo_other = ALGO_ATTRS_RSA2048;
 
     // PW Status Bytes (tag C4, must be exactly 7 bytes per
     // `ocard/data/pw_status.rs`). Real YubiKey 5 fixture values: PW1 not
@@ -358,7 +390,7 @@ fn build_application_related_data(manufacturer: u16, serial: u32, uif_sig: [u8; 
     out.extend(tlv(&[0x4f], &aid));
     out.extend(tlv(&[0x5f, 0x52], &historical_bytes));
     out.extend(tlv(&[0xc0], &ext_caps));
-    out.extend(tlv(&[0xc1], &algo_sig));
+    out.extend(tlv(&[0xc1], algo_sig));
     out.extend(tlv(&[0xc2], &algo_other));
     out.extend(tlv(&[0xc3], &algo_other));
     out.extend(tlv(&[0xc4], &pw_status));
@@ -374,13 +406,30 @@ fn build_application_related_data(manufacturer: u16, serial: u32, uif_sig: [u8; 
 
 /// Build the response to `GENERATE ASYMMETRIC KEY PAIR` /
 /// `GET PUBLIC KEY` (INS 0x47): a single TLV, tag `7F49` ("Public Key",
-/// `ocard/tags.rs`), wrapping a nested `86` ("Public key - EC point",
-/// `ocard/tags.rs::PublicKeyDataEccPoint`) with the fabricated raw point
-/// bytes. Grounded in `ocard/keys.rs::tlv_to_pubkey`, which looks up tag
-/// `86` specifically (RSA would instead need tags `81`/`82` present, `86`
-/// absent).
-fn build_generate_key_response() -> Vec<u8> {
-    let point = tlv(&[0x86], &FAKE_ED25519_PUBLIC_KEY);
+/// `ocard/tags.rs`), wrapping either a nested `86` ("Public key - EC
+/// point", `ocard/tags.rs::PublicKeyDataEccPoint`) with the fabricated
+/// Ed25519 point, or nested `81`/`82` (RSA modulus/exponent) — grounded in
+/// `ocard/keys.rs::tlv_to_pubkey`, which distinguishes RSA vs ECC purely by
+/// which of these tags are present (`86` alone → ECC, `81`+`82` with no
+/// `86` → RSA), not by the algorithm-attribute value itself.
+///
+/// `algo_sig` is [`FakeCard::algo_sig`]'s *current* raw bytes: this
+/// answers RSA2048 unless a real `PUT DATA` write has actually
+/// reconfigured the Signature slot to EdDSA first (algo id `0x16`, see
+/// [`FakeCard::algo_sig`]'s own doc comment) — a real card does the same
+/// (`generate_key` always generates whatever algorithm is *currently
+/// configured*, see `provision.rs`'s doc comment), and this is exactly
+/// the behavior the fake needs to catch a caller that forgets to
+/// configure the algorithm before generating.
+fn build_generate_key_response(algo_sig: &[u8]) -> Vec<u8> {
+    const ALGO_ID_EDDSA: u8 = 0x16;
+    let point = if algo_sig.first() == Some(&ALGO_ID_EDDSA) {
+        tlv(&[0x86], &FAKE_ED25519_PUBLIC_KEY)
+    } else {
+        let mut v = tlv(&[0x81], &FAKE_RSA_MODULUS);
+        v.extend(tlv(&[0x82], &FAKE_RSA_EXPONENT));
+        v
+    };
     tlv(&[0x7f, 0x49], &point)
 }
 
@@ -437,6 +486,16 @@ pub struct FakeCard {
     pw1: PinSlot,
     pw3: PinSlot,
     uif_sig: [u8; 2],
+    /// The Signature slot's current algorithm-attribute DO bytes (GET DATA
+    /// tag `C1`) — starts at [`ALGO_ATTRS_RSA2048`] (matching real
+    /// factory-fresh hardware) and only changes when a real `PUT DATA`
+    /// write to tag `C1` lands (`ins::PUT_DATA`'s `(0x00, 0xc1)` arm). Read
+    /// back both by the `GET DATA` handler (via
+    /// [`build_application_related_data`]) and by the `GENERATE ASYMMETRIC
+    /// KEY PAIR` handler (via [`build_generate_key_response`]), so the two
+    /// stay consistent with each other and with whatever was actually
+    /// written — see this module's doc comment, section 4.
+    algo_sig: Vec<u8>,
     signing_key_generated: bool,
     touch_timeout: bool,
     /// PW1 (signing mode, VERIFY P2 `0x81`) has been successfully
@@ -462,6 +521,7 @@ impl FakeCard {
             pw1: PinSlot::new(FACTORY_DEFAULT_USER_PIN),
             pw3: PinSlot::new(FACTORY_DEFAULT_ADMIN_PIN),
             uif_sig: [0x00, 0x20], // TouchPolicy::Off, Features::Button
+            algo_sig: ALGO_ATTRS_RSA2048.to_vec(),
             signing_key_generated: false,
             touch_timeout: false,
             verified_pw1_sign: false,
@@ -620,6 +680,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
                         self.card.manufacturer,
                         self.card.serial,
                         self.card.uif_sig,
+                        &self.card.algo_sig,
                     )))
                 } else {
                     // StatusBytes::ReferencedDataNotFound — a real card's
@@ -693,10 +754,10 @@ impl CardTransaction for FakeCardTransaction<'_> {
                             return Ok(vec![0x69, 0x82]);
                         }
                         self.card.signing_key_generated = true;
-                        Ok(ok(build_generate_key_response()))
+                        Ok(ok(build_generate_key_response(&self.card.algo_sig)))
                     }
                     0x81 if self.card.signing_key_generated => {
-                        Ok(ok(build_generate_key_response()))
+                        Ok(ok(build_generate_key_response(&self.card.algo_sig)))
                     }
                     _ => Ok(vec![0x6A, 0x88]), // no key generated yet
                 }
@@ -723,6 +784,25 @@ impl CardTransaction for FakeCardTransaction<'_> {
                         && bytes.len() >= 2
                     {
                         self.card.uif_sig = [bytes[0], bytes[1]];
+                    }
+                }
+                if (p1, p2) == (0x00, 0xc1) {
+                    // AlgorithmAttributesSignature — persist the write into
+                    // `algo_sig` so later `GET DATA`/`GENERATE ASYMMETRIC
+                    // KEY PAIR` reads reflect the change. Previously
+                    // discarded entirely (Finding 1 of this task's review):
+                    // this fake acknowledged the write but never actually
+                    // stored it, so a real bug that dropped the
+                    // `set_algorithm` call upstream couldn't be caught by
+                    // any test. Lc-bounded (not just `cmd.get(5..)`, unlike
+                    // the UifSig arm above) since this DO's length varies
+                    // by algorithm (6 bytes for RSA, 10 for EdDSA/Ed25519)
+                    // rather than always being 2.
+                    if let Some(&lc) = cmd.get(4) {
+                        let lc = lc as usize;
+                        if let Some(bytes) = cmd.get(5..5 + lc) {
+                            self.card.algo_sig = bytes.to_vec();
+                        }
                     }
                 }
                 Ok(ok(vec![]))
@@ -784,6 +864,7 @@ mod tests {
         Card,
         ocard::{
             KeyType,
+            algorithm::AlgoSimple,
             crypto::{PublicKeyMaterial, SigningAlgo},
             data::{Fingerprint, KeyGenerationTime},
         },
@@ -811,11 +892,18 @@ mod tests {
         assert_eq!(aid.manufacturer(), 0x0006);
         assert_eq!(aid.serial(), 0x0011_2233);
 
-        // Admin: generate a key on the Signing slot, then set touch policy.
+        // Admin: configure the Signing slot's algorithm to Ed25519 (the
+        // fake starts at RSA2048, same as real factory-fresh hardware —
+        // see this module's doc comment, section 4), generate a key, then
+        // set touch policy.
         let admin_pin = SecretString::from(std::str::from_utf8(FACTORY_DEFAULT_ADMIN_PIN).unwrap());
         let mut admin = tx
             .as_admin_card(admin_pin)
             .expect("admin PIN should verify against the fake's factory-default PW3");
+
+        admin
+            .set_algorithm(KeyType::Signing, AlgoSimple::Curve25519)
+            .expect("algorithm should be settable against the fake");
 
         fn fake_fingerprint(
             _pub_key: &PublicKeyMaterial,

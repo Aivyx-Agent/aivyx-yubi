@@ -26,12 +26,16 @@
 //! ```
 //! `PublicKeyMaterial` is an algorithm-tagged enum (`ocard/crypto.rs`):
 //! `E(EccPub)` for elliptic-curve keys (`EccPub::data() -> &[u8]`, the raw
-//! EC point) or `R(RSAPub)` for RSA. [`generate_signature_key`] below
-//! only ever expects `E(..)` with exactly 32 bytes (the Ed25519 point
-//! size) back — an `R(..)` result, or an `E(..)` of the wrong length,
-//! means the card generated the wrong algorithm (see the next point) and
-//! is reported as a [`YubiError::Other`] rather than silently truncated
-//! or panicking.
+//! EC point, and `EccPub::algo() -> &AlgorithmAttributes`, the algorithm
+//! actually used) or `R(RSAPub)` for RSA. [`generate_signature_key`] below
+//! only ever expects `E(..)` whose algorithm attribute is actually
+//! Ed25519/EdDSA (`EccAttributes::ecc_type()`/`curve()`, checked directly
+//! — not inferred from "32 bytes", since a Cv25519/X25519 point is also
+//! 32 bytes and would otherwise pass silently) and whose point is exactly
+//! 32 bytes back — an `R(..)` result, a non-Ed25519 `E(..)`, or an `E(..)`
+//! of the wrong length, means the card generated the wrong algorithm (see
+//! the next point) and is reported as a [`YubiError::Other`] rather than
+//! silently truncated or panicking.
 //!
 //! ## Real finding: the Signature slot does NOT default to Ed25519
 //!
@@ -40,12 +44,14 @@
 //! Signing) — it does not itself choose Ed25519 just because that's what
 //! this crate wants. A factory-fresh YubiKey's Signature slot defaults to
 //! RSA2048, not Ed25519/EdDSA. [`testing.rs`'s fake][crate::testing]
-//! sidesteps this by hardcoding tag `C1` to EdDSA/Ed25519 from the start
-//! (see its own doc comment, section 4) specifically to simplify this
-//! task's fixture — which means the fake's tests below *cannot* catch a
-//! missing algorithm-configuration step, since the fake's `GENERATE
-//! ASYMMETRIC KEY PAIR` handler answers with the fixed Ed25519 fixture
-//! point regardless of what P1/algorithm was actually requested.
+//! mirrors this: it starts at RSA2048 for tag `C1` (same as real
+//! hardware) and only reports Ed25519 once a real `PUT DATA` write to tag
+//! `C1` — the same write `set_algorithm` below actually performs — has
+//! landed (see its own doc comment, section 4). This means the fake's
+//! tests below *do* catch a missing algorithm-configuration step: deleting
+//! the `set_algorithm` call below makes the fake's `GENERATE ASYMMETRIC
+//! KEY PAIR` handler answer with an RSA key instead, which the
+//! `PublicKeyMaterial::R(_)` arm below rejects as a hard test failure.
 //!
 //! [`generate_signature_key`] therefore calls
 //! `Card<Admin>::set_algorithm(KeyType::Signing, AlgoSimple::Curve25519)`
@@ -115,8 +121,8 @@ use openpgp_card::{
     Card, Error as OpenpgpError,
     ocard::{
         KeyType, StatusBytes,
-        algorithm::AlgoSimple,
-        crypto::PublicKeyMaterial,
+        algorithm::{AlgoSimple, AlgorithmAttributes, Curve},
+        crypto::{EccType, PublicKeyMaterial},
         data::{Fingerprint, KeyGenerationTime, TouchPolicy},
     },
     state::Admin,
@@ -127,9 +133,20 @@ use crate::YubiError;
 /// The raw 32-byte Ed25519 public key point a successful
 /// [`generate_signature_key`] returns. A thin newtype (rather than a bare
 /// `[u8; 32]`) so a caller can't confuse this with some other 32-byte
-/// value (a PIN, a fingerprint prefix, ...) at a glance.
+/// value (a PIN, a fingerprint prefix, ...) at a glance. The inner byte
+/// array is private (construct via [`PublicKeyBytes::new`]) — a `pub`
+/// field would let anyone build one from arbitrary bytes via a plain
+/// tuple-struct literal, undercutting that same rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PublicKeyBytes(pub [u8; 32]);
+pub struct PublicKeyBytes([u8; 32]);
+
+impl PublicKeyBytes {
+    /// Construct a `PublicKeyBytes` from a raw 32-byte Ed25519 public key
+    /// point.
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
 
 impl AsRef<[u8]> for PublicKeyBytes {
     fn as_ref(&self) -> &[u8] {
@@ -154,6 +171,18 @@ impl From<PublicKeyBytes> for [u8; 32] {
 /// (`AlgoSimple::Curve25519`) before generating, since a factory-default
 /// card's Signature slot is RSA2048, not Ed25519 — see this module's doc
 /// comment for the real-API finding behind this.
+///
+/// # This is destructive if the slot already holds a key
+///
+/// `set_algorithm`'s underlying `PUT DATA` write resets the Signature
+/// slot on real hardware, and `generate_key` overwrites whatever private
+/// key currently occupies it — there is no card-side "don't clobber an
+/// existing key" guard. Per this crate's design spec, provisioning is a
+/// one-time operation performed against a freshly-reset or never-before-
+/// provisioned card, so this is accepted rather than defended against in
+/// code. Callers (including the CLI provisioning flow) must not call this
+/// idempotently or accidentally against a card that already has a
+/// Signature-slot key they care about — doing so silently destroys it.
 pub fn generate_signature_key(
     admin: &mut Card<Admin<'_, '_>>,
 ) -> Result<PublicKeyBytes, YubiError> {
@@ -167,6 +196,26 @@ pub fn generate_signature_key(
 
     match pub_key {
         PublicKeyMaterial::E(ecc) => {
+            // A 32-byte point alone doesn't prove Ed25519 -- Cv25519/X25519
+            // points are also 32 bytes (this matters specifically for the
+            // "card pre-set to a 25519 curve where `set_algorithm` silently
+            // no-ops" scenario this module's doc comment describes: that
+            // could leave the Signature slot on X25519, and a bare length
+            // check wouldn't notice). Check the actual curve/type the card
+            // reports instead.
+            let is_ed25519 = matches!(
+                ecc.algo(),
+                AlgorithmAttributes::Ecc(attrs)
+                    if attrs.ecc_type() == EccType::EdDSA && *attrs.curve() == Curve::Ed25519
+            );
+            if !is_ed25519 {
+                return Err(YubiError::Other(format!(
+                    "card generated a {:?} key in the Signature slot instead of Ed25519/EdDSA \
+                     -- this card's Signature slot algorithm attribute may not be changeable to \
+                     Curve25519",
+                    ecc.algo()
+                )));
+            }
             let bytes: [u8; 32] = ecc.data().try_into().map_err(|_| {
                 YubiError::Other(format!(
                     "card returned a {}-byte public key point for the Signature slot, expected \
@@ -174,7 +223,7 @@ pub fn generate_signature_key(
                     ecc.data().len()
                 ))
             })?;
-            Ok(PublicKeyBytes(bytes))
+            Ok(PublicKeyBytes::new(bytes))
         }
         PublicKeyMaterial::R(_) => Err(YubiError::Other(
             "card generated an RSA key in the Signature slot instead of Ed25519/EdDSA -- this \
@@ -268,8 +317,8 @@ mod tests {
         let pub_key = generate_signature_key(&mut admin)
             .expect("key generation should succeed against the fake");
 
-        assert_eq!(pub_key.0, FakeCard::fake_public_key());
-        assert_eq!(pub_key, PublicKeyBytes(FakeCard::fake_public_key()));
+        assert_eq!(<[u8; 32]>::from(pub_key), FakeCard::fake_public_key());
+        assert_eq!(pub_key, PublicKeyBytes::new(FakeCard::fake_public_key()));
     }
 
     #[test]

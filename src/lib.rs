@@ -21,15 +21,19 @@ pub mod testing;
 use openpgp_card::ocard::StatusBytes;
 
 /// This crate's public error type — every public function in
-/// `discovery`/`pin` (and later tasks' `keygen`/`sign`) returns this,
+/// `discovery`/`pin`/`provision` (and a later task's `sign`) returns this,
 /// rather than leaking `openpgp_card::Error` or
 /// `card_backend::SmartcardError` directly, so downstream callers
 /// (`aivyx-federation`, `aivyx-cli`) get a stable, crate-local error type
 /// instead of depending on this crate's own dependency versions.
 ///
-/// The variant set starts from the brief's proposal and adds one
-/// (`PinBlocked`) found necessary while implementing `pin.rs` — see that
-/// variant's own doc comment.
+/// The variant set starts from the brief's proposal and adds two beyond
+/// it: [`PinBlocked`], found necessary while implementing `pin.rs`, and
+/// [`AdminAuthRequired`], found necessary while implementing `provision.rs`
+/// — see each variant's own doc comment.
+///
+/// [`PinBlocked`]: YubiError::PinBlocked
+/// [`AdminAuthRequired`]: YubiError::AdminAuthRequired
 #[derive(Debug, thiserror::Error)]
 pub enum YubiError {
     /// No card/reader found, or `pcscd` unreachable. The `String` names
@@ -110,7 +114,7 @@ pub enum YubiError {
     ///
     /// [`Other`]: YubiError::Other
     #[error(
-        "admin-gated card operation attempted without the Admin PIN (PW3) verified first -- \
+        "admin-gated card operation attempted without the Admin PIN (PW3) verified first — \
          verify the Admin PIN (e.g. via `Card<Transaction>::as_admin_card`) before retrying"
     )]
     AdminAuthRequired,
