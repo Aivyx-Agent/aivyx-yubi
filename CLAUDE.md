@@ -36,3 +36,14 @@ documented follow-up, not something this crate's own CI/tests can prove.
 
 - `README.md` — setup and usage.
 - `docs/superpowers/specs/2026-09-07-aivyx-yubi-design.md` — full design.
+
+## Known, deliberately-undefended limitations
+
+- Requires `pcscd` — a real new system dependency for anyone using this
+  crate, not required by any other Aivyx repo.
+- No PIV support. OpenPGP-applet-only; revisit if the `yubikey` crate
+  (or an alternative) catches up with firmware 5.7's PIV Ed25519
+  support.
+- No test in this crate's own suite exercises real hardware — a real
+  physical touch, a real PIN prompt, or real on-card key generation
+  against actual silicon. All tests run against a fake card backend.
