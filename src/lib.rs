@@ -6,6 +6,7 @@ pub use openpgp_card::Card;
 
 pub mod discovery;
 pub mod pin;
+pub mod provision;
 
 /// Fake `CardBackend`/`CardTransaction` test double standing in for real
 /// YubiKey hardware. See the module's own doc comment for how it was
@@ -94,6 +95,25 @@ pub enum YubiError {
         /// Accurate, PIN-kind-specific recovery guidance.
         recovery_hint: &'static str,
     },
+
+    /// An admin-gated card operation (key generation, touch-policy
+    /// change, ...) was attempted without the Admin PIN (PW3) having
+    /// been verified first (real status word `69 82`,
+    /// `StatusBytes::SecurityStatusNotSatisfied`). Added for `provision.rs`
+    /// (Task 4): both `provision::generate_signature_key` and
+    /// `provision::set_signature_touch_policy_fixed` require a
+    /// PW3-authenticated `Card<Admin>` and map this specific status word
+    /// to this variant (via `provision.rs`'s own `map_admin_op_error`)
+    /// rather than letting it fall through to the generic [`Other`]
+    /// catch-all, since "you forgot to verify the Admin PIN" is a much
+    /// more actionable message than a raw status-word string.
+    ///
+    /// [`Other`]: YubiError::Other
+    #[error(
+        "admin-gated card operation attempted without the Admin PIN (PW3) verified first -- \
+         verify the Admin PIN (e.g. via `Card<Transaction>::as_admin_card`) before retrying"
+    )]
+    AdminAuthRequired,
 
     /// Catch-all for every other real error this crate's dependencies can
     /// report (raw APDU status words not covered above, transport

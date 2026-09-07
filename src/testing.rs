@@ -179,13 +179,17 @@
 //! - **PIN-verification session state IS enforced**, unlike the above
 //!   fake-only conveniences: [`FakeCard`] tracks `verified_pw1_sign`/
 //!   `verified_pw3_admin` and rejects `PSO: COMPUTE DIGITAL SIGNATURE` /
-//!   `GENERATE ASYMMETRIC KEY PAIR` with the real `6982
+//!   `GENERATE ASYMMETRIC KEY PAIR` / any `PUT DATA` with the real `6982
 //!   SecurityStatusNotSatisfied` status word (`ocard/mod.rs`'s
 //!   `StatusBytes::SecurityStatusNotSatisfied`, mapped from `(0x69,
 //!   0x82)`) if the matching `VERIFY` hasn't succeeded first — so a real
-//!   bug in a later task that forgets to verify the PIN before signing
-//!   or generating a key fails its test against this fake instead of
-//!   silently passing. Both flags reset to `false` on every fresh
+//!   bug in a later task that forgets to verify the PIN before signing,
+//!   generating a key, or writing admin data (algorithm attributes,
+//!   touch policy, ...) fails its test against this fake instead of
+//!   silently passing. (The `PUT DATA` gate was added in Task 4; Task 3's
+//!   review had flagged it as unconditionally-acknowledged until then —
+//!   see `provision.rs`'s touch-policy-without-admin-auth test, which
+//!   needs it.) Both flags reset to `false` on every fresh
 //!   `CardBackend::transaction()` call, an approximation of a real card's
 //!   behavior (which actually keeps PIN-verified state until a card
 //!   reset/power-cycle, not per logical PC/SC transaction) chosen because
@@ -699,11 +703,19 @@ impl CardTransaction for FakeCardTransaction<'_> {
             }
 
             ins::PUT_DATA => {
-                // Every PUT DATA this fake receives (touch policy, creation
-                // time, fingerprint, ...) is unconditionally acknowledged.
-                // Later tasks needing a PUT-DATA failure scenario should add
-                // a dedicated `FakeCard` builder toggle rather than
-                // overloading this generic path.
+                if !self.card.verified_pw3_admin {
+                    // StatusBytes::SecurityStatusNotSatisfied — a real
+                    // card requires PW3 (admin) VERIFYed before any PUT
+                    // DATA write (algorithm attributes, touch policy,
+                    // creation time, fingerprint, ...), same as GENERATE
+                    // ASYMMETRIC KEY PAIR above. Previously left
+                    // unconditionally-acknowledged (a known gap flagged
+                    // during Task 3's review); fixed here (Task 4) because
+                    // `set_signature_touch_policy_fixed`'s own
+                    // without-admin-auth test needs this gate to mean
+                    // anything.
+                    return Ok(vec![0x69, 0x82]);
+                }
                 if (p1, p2) == (0x00, 0xd6) {
                     // UifSig — remember it so a later `user_interaction_flag`
                     // read reflects the change.
