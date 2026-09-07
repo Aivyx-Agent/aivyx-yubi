@@ -60,8 +60,13 @@ pub const FACTORY_DEFAULT_ADMIN_PIN: &str = "12345678";
 /// [`YubiError::PinBlocked`] variant (see that variant's doc comment for
 /// why the User and Admin cases are not symmetric and must not share one
 /// generic message).
+///
+/// `pub(crate)` (not private): `sign.rs` (Task 5) needs the exact same
+/// User-PIN-blocked labeling for a blocked PW1 encountered during
+/// `verify_user_signing_pin`, and reuses this type/its `blocked_error`
+/// rather than duplicating the recovery-hint wording a second time.
 #[derive(Clone, Copy)]
-enum PinKind {
+pub(crate) enum PinKind {
     User,
     Admin,
 }
@@ -69,7 +74,7 @@ enum PinKind {
 impl PinKind {
     /// Build the [`YubiError::PinBlocked`] this PIN kind should report,
     /// with an accurate, kind-specific recovery hint.
-    fn blocked_error(self) -> YubiError {
+    pub(crate) fn blocked_error(self) -> YubiError {
         match self {
             PinKind::User => YubiError::PinBlocked {
                 pin_kind: "User",

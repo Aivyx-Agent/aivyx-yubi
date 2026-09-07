@@ -7,6 +7,14 @@ pub use openpgp_card::Card;
 pub mod discovery;
 pub mod pin;
 pub mod provision;
+pub mod sign;
+
+// Re-exported at the crate root: this is the crate's main external API
+// surface (`aivyx-federation`'s `Identity`, Task 7, is the intended
+// consumer) — see `sign.rs`'s own doc comment for the full design. A
+// caller shouldn't need to know `YubiKeySigner` happens to live in a
+// `sign` submodule to reach it.
+pub use sign::YubiKeySigner;
 
 /// Fake `CardBackend`/`CardTransaction` test double standing in for real
 /// YubiKey hardware. See the module's own doc comment for how it was
