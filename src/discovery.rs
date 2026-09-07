@@ -31,24 +31,32 @@
 //! the latter as the outer `Result::Err` (mapped by
 //! [`map_enumeration_error`]).
 //!
-//! [`discover_card_from`] mirrors the real crate's own
-//! `Card::<Open>::open_by_ident` (`openpgp-card-0.7.0/src/lib.rs`
-//! ~lines 118-141), which takes the exact same `impl Iterator<Item =
-//! Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>` shape and
-//! `.filter_map(|c| c.ok())`s it — factored out here (rather than inlined
-//! into [`discover_real_card`]) so the actual selection logic is
-//! independently testable against [`crate::testing::FakeCard`], which has
-//! no real PC/SC reader to enumerate through.
+//! [`discover_card_from`]'s enumeration-level filtering matches the real
+//! crate's own `Card::<Open>::open_by_ident` (`openpgp-card-0.7.0/src/
+//! lib.rs` ~lines 118-141), which takes the exact same `impl
+//! Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>,
+//! SmartcardError>>` shape and `.filter_map(|c| c.ok())`s it — factored
+//! out here (rather than inlined into [`discover_real_card`]) so the
+//! actual selection logic is independently testable against
+//! [`crate::testing::FakeCard`], which has no real PC/SC reader to
+//! enumerate through.
 //!
-//! `openpgp_card::Card::<Open>::new` itself immediately `SELECT`s the
-//! OpenPGP application and reads Application Related Data
-//! (`ocard/mod.rs::OpenPGP::new`, confirmed by reading it directly) — so
-//! a backend that connects but isn't a live OpenPGP-capable card (wrong
-//! applet, card removed mid-enumeration) fails at *that* point too, not
-//! only at `card_backends()`'s per-reader connect step.
-//! [`discover_card_from`] treats that failure the same way as a
-//! per-reader connection failure: skip it, keep looking at the next
-//! candidate.
+//! **Where this deliberately diverges from `open_by_ident`**: after that
+//! `filter_map`, the real `open_by_ident` calls `Card::<Open>::new(b)?`
+//! with a bare `?` (confirmed by reading it directly) — a `Card::new`
+//! failure on any one candidate **aborts the whole search** with an
+//! error, it does not move on to the next candidate. `openpgp_card::
+//! Card::<Open>::new` itself immediately `SELECT`s the OpenPGP
+//! application and reads Application Related Data (`ocard/mod.rs::
+//! OpenPGP::new`, confirmed by reading it directly) — so a backend that
+//! connects but isn't a live OpenPGP-capable card (wrong applet, card
+//! removed mid-enumeration) fails at *that* point, distinct from
+//! `card_backends()`'s per-reader connect step. [`discover_card_from`]
+//! instead *skips* a `Card::new` failure and keeps trying the next
+//! candidate — a deliberate improvement for multi-reader environments
+//! (one broken or non-OpenPGP card plugged into one reader shouldn't
+//! prevent finding a working card plugged into a different reader), not
+//! an attempt to replicate `open_by_ident`'s own (more strict) behavior.
 //!
 //! `discover_real_card` itself has no automated test in this crate: it's
 //! the one real seam that talks to actual `pcscd`/PC/SC, which this
@@ -62,7 +70,7 @@
 use card_backend::{CardBackend, SmartcardError};
 use card_backend_pcsc::PcscBackend;
 use openpgp_card::{
-    Card,
+    Card, Error as OpenpgpError,
     state::{Open, Transaction},
 };
 
@@ -83,23 +91,45 @@ pub fn discover_real_card() -> Result<Card<Open>, YubiError> {
 /// The backend-agnostic core of [`discover_real_card`]: given an iterator
 /// of candidate backends (real PC/SC ones, or — in this crate's own
 /// tests — [`crate::testing::FakeCard`]s), returns the first one that's a
-/// live, SELECT-able OpenPGP card. Errors from individual candidates
-/// (card absent, wrong applet, ...) are swallowed and treated as "try the
-/// next one", matching `openpgp_card::Card::open_by_ident`'s own
-/// behavior (see this module's doc comment).
+/// live, SELECT-able OpenPGP card. Per-candidate enumeration errors
+/// (`Err` items in the iterator itself) are filtered out the same way
+/// `openpgp_card::Card::open_by_ident` does; a `Card::new` failure on a
+/// present candidate (card absent, wrong applet, ...) is then skipped and
+/// the next candidate tried — a deliberate departure from
+/// `open_by_ident`, which aborts its whole search on that failure via a
+/// bare `?`. See this module's doc comment for the full grounding and
+/// rationale.
 pub fn discover_card_from(
     cards: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
 ) -> Result<Card<Open>, YubiError> {
+    // Distinguishes "no card was ever reachable" from "a card was
+    // reachable but failed to open as OpenPGP" (wrong applet, corrupted
+    // ART, card pulled mid-detection, ...), so the final error doesn't
+    // misleadingly claim "no reader/card at all" when a card genuinely
+    // is inserted but broken.
+    let mut saw_broken_candidate = false;
     for backend in cards.filter_map(Result::ok) {
-        if let Ok(card) = Card::<Open>::new(backend) {
-            return Ok(card);
+        match Card::<Open>::new(backend) {
+            Ok(card) => return Ok(card),
+            // `Error::Smartcard(SmartcardError::CardNotFound(_))` is what
+            // `Card::new` propagates (via `?` on `op.transaction()`,
+            // `ocard/mod.rs::OpenPGP::new`) when *this* candidate simply
+            // had no card present — not evidence of a broken card, so it
+            // doesn't set the flag below.
+            Err(OpenpgpError::Smartcard(SmartcardError::CardNotFound(_))) => {}
+            Err(_) => saw_broken_candidate = true,
         }
     }
-    Err(YubiError::CardNotFound(
+    let message = if saw_broken_candidate {
+        "a card was found but could not be opened as an OpenPGP card (wrong applet, \
+         corrupted card state, or the card was removed mid-detection) — this is not the \
+         \"no reader/card at all\" case; check that a genuine OpenPGP-capable card is \
+         inserted"
+    } else {
         "no OpenPGP-capable card found on any connected PC/SC reader — insert a YubiKey \
          and retry"
-            .to_string(),
-    ))
+    };
+    Err(YubiError::CardNotFound(message.to_string()))
 }
 
 /// Read a discovered card's serial/AID as a stable, human-readable
@@ -186,6 +216,106 @@ mod tests {
             vec![Ok(FakeCard::absent().into()), Ok(FakeCard::new().into())];
 
         assert!(discover_card_from(backends.into_iter()).is_ok());
+    }
+
+    #[test]
+    fn skips_a_per_item_enumeration_error_and_finds_the_working_candidate() {
+        // The real `card_backends()` iterator can yield a per-item `Err`
+        // (e.g. a reader that failed mid-enumeration), not just
+        // `Ok`-wrapped present/absent cards — `.filter_map(Result::ok)`
+        // must skip that item and keep looking, same as
+        // `open_by_ident`'s own enumeration-level filtering.
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> = vec![
+            Err(SmartcardError::Error("reader glitch".to_string())),
+            Ok(FakeCard::new().into()),
+        ];
+
+        assert!(discover_card_from(backends.into_iter()).is_ok());
+    }
+
+    #[test]
+    fn broken_but_present_card_is_reported_distinctly_from_no_card_at_all() {
+        // `FakeCard::broken()` connects and SELECTs fine but fails to
+        // provide Application Related Data (wrong applet/corrupted
+        // state) — `Card::new` fails with a `CardStatus` error, not
+        // `Smartcard(CardNotFound)`, so the resulting message must say a
+        // card WAS found rather than reusing the "no reader/card at all"
+        // wording (Finding 5).
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(FakeCard::broken().into())];
+
+        let err = discover_card_from(backends.into_iter())
+            .err()
+            .expect("a broken candidate should not be selected");
+        match err {
+            YubiError::CardNotFound(msg) => {
+                assert!(
+                    msg.contains("was found but could not be opened"),
+                    "message should distinguish a broken card from no card at all: {msg}"
+                );
+            }
+            other => panic!("expected YubiError::CardNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_error_names_pcscd_as_the_likely_cause() {
+        // `SmartcardError::ContextError` (`card-backend-0.2.0/src/lib.rs`)
+        // is what `PcscBackend::card_backends` surfaces when it can't
+        // establish a PC/SC context at all — the "pcscd isn't running"
+        // case (see this module's doc comment).
+        let err = map_enumeration_error(SmartcardError::ContextError("boom".to_string()));
+        match err {
+            YubiError::CardNotFound(msg) => {
+                assert!(msg.contains("pcscd"), "message should name pcscd: {msg}");
+                assert!(
+                    msg.contains("boom"),
+                    "message should include the underlying cause: {msg}"
+                );
+            }
+            other => panic!("expected YubiError::CardNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_error_names_pcscd_as_the_likely_cause() {
+        // `SmartcardError::ReaderError` is what `card_backends` surfaces
+        // when listing readers itself fails.
+        let err = map_enumeration_error(SmartcardError::ReaderError("boom".to_string()));
+        match err {
+            YubiError::CardNotFound(msg) => {
+                assert!(msg.contains("pcscd"), "message should name pcscd: {msg}");
+                assert!(
+                    msg.contains("boom"),
+                    "message should include the underlying cause: {msg}"
+                );
+            }
+            other => panic!("expected YubiError::CardNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_reader_found_error_reports_card_not_found_naming_a_reader() {
+        let err = map_enumeration_error(SmartcardError::NoReaderFoundError);
+        match err {
+            YubiError::CardNotFound(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("reader"),
+                    "message should mention a reader: {msg}"
+                );
+            }
+            other => panic!("expected YubiError::CardNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_smartcard_error_variants_fall_back_to_other() {
+        // Per-connection failure variants aren't documented/observed to
+        // occur on `card_backends()`'s *outer* `Result` (see this
+        // module's doc comment) — confirm the fallback arm behaves as
+        // documented rather than silently mis-mapping them too.
+        let err = map_enumeration_error(SmartcardError::CardNotFound("boom".to_string()));
+        assert!(matches!(err, YubiError::Other(_)));
     }
 
     #[test]

@@ -70,18 +70,30 @@ pub enum YubiError {
 
     /// The PIN's retry counter has hit zero (real status word `69 83`,
     /// `StatusBytes::AuthenticationMethodBlocked`); the card refuses any
-    /// further `VERIFY` for it until unblocked via the Admin PIN/Reset
-    /// Code. Added beyond the brief's original variant list:
-    /// `pin::is_pin_factory_default`'s only real way to check a PIN
-    /// (attempting `VERIFY` with the well-known default — see
-    /// `pin.rs`'s doc comment) can hit this real card state, and folding
-    /// it into `PinIncorrect` would misleadingly suggest a retry could
-    /// still succeed.
-    #[error(
-        "PIN is blocked (too many incorrect attempts) — unblock it via the admin PIN/Reset \
-         Code before proceeding"
-    )]
-    PinBlocked,
+    /// further `VERIFY` for it until unblocked. Added beyond the brief's
+    /// original variant list: `pin::is_pin_factory_default`'s only real
+    /// way to check a PIN (attempting `VERIFY` with the well-known
+    /// default — see `pin.rs`'s doc comment) can hit this real card
+    /// state, and folding it into `PinIncorrect` would misleadingly
+    /// suggest a retry could still succeed.
+    ///
+    /// Carries which PIN blocked (`pin_kind`, `"User"` or `"Admin"`) and
+    /// an accurate recovery hint for that specific PIN, because the two
+    /// cases are **not** symmetric: a blocked User PIN (PW1) is
+    /// recoverable via the Admin PIN's RESET RETRY COUNTER operation, but
+    /// a blocked Admin PIN (PW3) is *not* self-recoverable — only a
+    /// pre-configured Reset Code or a full TERMINATE+ACTIVATE (which
+    /// erases all keys) can recover from that state. A single fixed
+    /// message claiming "unblock it via the admin PIN" would be actively
+    /// wrong (circular) for the Admin-PIN-blocked case. See
+    /// `pin.rs::PinKind` for where these two variants are constructed.
+    #[error("{pin_kind} PIN is blocked (too many failed attempts). {recovery_hint}")]
+    PinBlocked {
+        /// Which PIN blocked: `"User"` or `"Admin"`.
+        pin_kind: &'static str,
+        /// Accurate, PIN-kind-specific recovery guidance.
+        recovery_hint: &'static str,
+    },
 
     /// Catch-all for every other real error this crate's dependencies can
     /// report (raw APDU status words not covered above, transport
@@ -97,7 +109,23 @@ impl From<openpgp_card::Error> for YubiError {
                 YubiError::PinIncorrect
             }
             openpgp_card::Error::CardStatus(StatusBytes::AuthenticationMethodBlocked) => {
-                YubiError::PinBlocked
+                // This blanket conversion has no context on which PIN
+                // (User/PW1 or Admin/PW3) was being verified when the
+                // card reported it blocked — that distinction matters a
+                // lot (see `PinBlocked`'s doc comment) but callers that
+                // *do* have that context (e.g. `pin::verify_matches_default`)
+                // construct the correctly-labeled `PinBlocked` variant
+                // directly instead of going through this `From` impl.
+                // This fallback deliberately doesn't guess a pin_kind and
+                // gives recovery guidance that's accurate for either case.
+                YubiError::PinBlocked {
+                    pin_kind: "A",
+                    recovery_hint: "Check which PIN blocked: a blocked User PIN can be reset \
+                                    via the Admin PIN's RESET RETRY COUNTER operation, but a \
+                                    blocked Admin PIN cannot recover itself — that requires a \
+                                    pre-configured Reset Code or a full card reset \
+                                    (TERMINATE+ACTIVATE, which erases all keys).",
+                }
             }
             other => YubiError::Other(other.to_string()),
         }

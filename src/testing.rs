@@ -427,6 +427,7 @@ impl PinSlot {
 /// `openpgp_card::Card::new(fake_card)`.
 pub struct FakeCard {
     present: bool,
+    broken: bool,
     manufacturer: u16,
     serial: u32,
     pw1: PinSlot,
@@ -451,6 +452,7 @@ impl FakeCard {
     pub fn new() -> Self {
         Self {
             present: true,
+            broken: false,
             manufacturer: 0x0006, // "Yubico AB", per `ApplicationIdentifier::manufacturer_name`
             serial: 0x0011_2233,
             pw1: PinSlot::new(FACTORY_DEFAULT_USER_PIN),
@@ -470,6 +472,22 @@ impl FakeCard {
     pub fn absent() -> Self {
         let mut card = Self::new();
         card.present = false;
+        card
+    }
+
+    /// Simulate a card that's physically reachable (`CardBackend::
+    /// transaction` succeeds, `SELECT` succeeds) but isn't a usable
+    /// OpenPGP card — e.g. a wrong/non-OpenPGP applet, or a corrupted
+    /// Application Related Data structure. `GET DATA` for tag `6E`
+    /// (Application Related Data) fails with the real `6A88`
+    /// `ReferencedDataNotFound` status word, so `openpgp_card::Card::new`
+    /// fails *after* connecting — distinct from [`Self::absent`], which
+    /// fails at `CardBackend::transaction` itself before any APDU is
+    /// sent. Added to exercise `discovery::discover_card_from`'s
+    /// "found-but-broken vs. truly absent" distinction.
+    pub fn broken() -> Self {
+        let mut card = Self::new();
+        card.broken = true;
         card
     }
 
@@ -588,6 +606,12 @@ impl CardTransaction for FakeCardTransaction<'_> {
 
             ins::GET_DATA => {
                 if (p1, p2) == TAG_APPLICATION_RELATED_DATA {
+                    if self.card.broken {
+                        // Simulate a card that connects but can't provide
+                        // Application Related Data (wrong applet,
+                        // corrupted state) — see `FakeCard::broken`.
+                        return Ok(vec![0x6A, 0x88]); // StatusBytes::ReferencedDataNotFound
+                    }
                     Ok(ok(build_application_related_data(
                         self.card.manufacturer,
                         self.card.serial,

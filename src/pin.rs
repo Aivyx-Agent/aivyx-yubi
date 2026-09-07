@@ -55,6 +55,39 @@ pub const FACTORY_DEFAULT_USER_PIN: &str = "123456";
 /// module's doc comment for where this is grounded.
 pub const FACTORY_DEFAULT_ADMIN_PIN: &str = "12345678";
 
+/// Which PIN a [`verify_matches_default`] call is checking — needed so a
+/// blocked-PIN outcome can be reported as the correctly-labeled
+/// [`YubiError::PinBlocked`] variant (see that variant's doc comment for
+/// why the User and Admin cases are not symmetric and must not share one
+/// generic message).
+#[derive(Clone, Copy)]
+enum PinKind {
+    User,
+    Admin,
+}
+
+impl PinKind {
+    /// Build the [`YubiError::PinBlocked`] this PIN kind should report,
+    /// with an accurate, kind-specific recovery hint.
+    fn blocked_error(self) -> YubiError {
+        match self {
+            PinKind::User => YubiError::PinBlocked {
+                pin_kind: "User",
+                recovery_hint: "Unblock it using the Admin PIN via the card's RESET RETRY \
+                                 COUNTER operation.",
+            },
+            PinKind::Admin => YubiError::PinBlocked {
+                pin_kind: "Admin",
+                recovery_hint: "This cannot be recovered with the Admin PIN itself -- only a \
+                                 pre-configured Reset Code (if one was set up) or a full card \
+                                 reset (TERMINATE+ACTIVATE, which erases all keys) can recover \
+                                 from this state. Contact your card's documentation for the \
+                                 exact recovery procedure.",
+            },
+        }
+    }
+}
+
 /// True if the card's User PIN (PW1) and/or Admin PIN (PW3) is still at
 /// its OpenPGP-card factory default. Either being unchanged is treated
 /// as "still default": PW3 gates key generation and other admin
@@ -65,10 +98,14 @@ pub const FACTORY_DEFAULT_ADMIN_PIN: &str = "12345678";
 /// see this module's doc comment for the real-retry-counter cost of that
 /// and why there's no cheaper real-protocol way to ask.
 pub fn is_pin_factory_default(tx: &mut Card<Transaction<'_>>) -> Result<bool, YubiError> {
-    let user_is_default =
-        verify_matches_default(tx.verify_user_pin(SecretString::from(FACTORY_DEFAULT_USER_PIN)))?;
-    let admin_is_default =
-        verify_matches_default(tx.verify_admin_pin(SecretString::from(FACTORY_DEFAULT_ADMIN_PIN)))?;
+    let user_is_default = verify_matches_default(
+        tx.verify_user_pin(SecretString::from(FACTORY_DEFAULT_USER_PIN)),
+        PinKind::User,
+    )?;
+    let admin_is_default = verify_matches_default(
+        tx.verify_admin_pin(SecretString::from(FACTORY_DEFAULT_ADMIN_PIN)),
+        PinKind::Admin,
+    )?;
     Ok(user_is_default || admin_is_default)
 }
 
@@ -86,15 +123,24 @@ pub fn require_pin_changed(tx: &mut Card<Transaction<'_>>) -> Result<(), YubiErr
 /// Interpret the result of a `VERIFY`-with-default attempt: success means
 /// the PIN is (still) that default; a plain wrong-PIN rejection
 /// (`PasswordNotChecked`, real status word `63 Cx`) means it's been
-/// changed away from the default; anything else (blocked, transport
-/// failure, ...) is a real error this function can't paper over — it
-/// propagates via [`YubiError`]'s `From<openpgp_card::Error>` impl (see
-/// `lib.rs`), which maps `AuthenticationMethodBlocked` specifically to
-/// [`YubiError::PinBlocked`].
-fn verify_matches_default(result: Result<(), OpenpgpError>) -> Result<bool, YubiError> {
+/// changed away from the default; a blocked PIN (`AuthenticationMethodBlocked`,
+/// real status word `69 83`) is reported as the correctly-labeled
+/// [`YubiError::PinBlocked`] for `pin_kind` — this call site knows which
+/// PIN it was VERIFYing, so it constructs that variant directly rather
+/// than going through the context-unaware fallback in [`YubiError`]'s
+/// `From<openpgp_card::Error>` impl (see `lib.rs`); anything else
+/// (transport failure, ...) is a real error this function can't paper
+/// over and propagates via that same `From` impl.
+fn verify_matches_default(
+    result: Result<(), OpenpgpError>,
+    pin_kind: PinKind,
+) -> Result<bool, YubiError> {
     match result {
         Ok(()) => Ok(true),
         Err(OpenpgpError::CardStatus(StatusBytes::PasswordNotChecked(_))) => Ok(false),
+        Err(OpenpgpError::CardStatus(StatusBytes::AuthenticationMethodBlocked)) => {
+            Err(pin_kind.blocked_error())
+        }
         Err(other) => Err(other.into()),
     }
 }
@@ -168,6 +214,55 @@ mod tests {
         }
 
         let err = is_pin_factory_default(&mut tx).unwrap_err();
-        assert!(matches!(err, YubiError::PinBlocked));
+        match err {
+            YubiError::PinBlocked {
+                pin_kind,
+                recovery_hint,
+            } => {
+                assert_eq!(pin_kind, "User");
+                // The User PIN case IS recoverable via the Admin PIN —
+                // must not carry the Admin-PIN-blocked wording.
+                assert!(recovery_hint.contains("Admin PIN"));
+                assert!(!recovery_hint.contains("cannot be recovered"));
+            }
+            other => {
+                panic!("expected YubiError::PinBlocked{{pin_kind: \"User\", ..}}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_admin_pin_surfaces_as_pin_blocked_with_non_recoverable_message() {
+        // User PIN (PW1) is left at its factory default throughout, so
+        // only the Admin PIN (PW3) side of each `is_pin_factory_default`
+        // call is a wrong VERIFY here.
+        let fake = FakeCard::new().with_changed_admin_pin(b"00000000");
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+
+        // Each call wrongly VERIFYs the default "12345678" against the
+        // real (changed) admin PIN "00000000", consuming one of PW3's 3
+        // real retries.
+        for _ in 0..3 {
+            is_pin_factory_default(&mut tx).unwrap();
+        }
+
+        let err = is_pin_factory_default(&mut tx).unwrap_err();
+        match err {
+            YubiError::PinBlocked {
+                pin_kind,
+                recovery_hint,
+            } => {
+                assert_eq!(pin_kind, "Admin");
+                // A blocked Admin PIN must NOT claim it can be recovered
+                // via the Admin PIN itself — that would be circular and
+                // actively wrong (this is the bug Finding 1 fixes).
+                assert!(recovery_hint.contains("cannot be recovered"));
+                assert!(!recovery_hint.contains("Unblock it using the Admin PIN"));
+            }
+            other => {
+                panic!("expected YubiError::PinBlocked{{pin_kind: \"Admin\", ..}}, got {other:?}")
+            }
+        }
     }
 }
