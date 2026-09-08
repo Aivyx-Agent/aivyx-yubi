@@ -54,8 +54,11 @@ documented follow-up, not something this crate's own CI/tests can prove.
   rustdoc). This is a **deliberate deviation** from the design spec's
   original `Identity::load_hardware(instance_id, binding_record)` sketch
   (`docs/superpowers/specs/2026-09-07-aivyx-yubi-design.md`), which took
-  no PIN parameter at all and implied a prompt-capable flow. Any consumer
-  (e.g. a future `aivyx-federation` integration) needs to explicitly
-  decide where/how a long-running daemon obtains and retains this PIN at
-  startup — this crate does not solve that problem, it only documents
-  that the problem exists.
+  no PIN parameter at all and implied a prompt-capable flow.
+  **Resolved** in `aivyx` (Phase 208, 2026-09-08, the first real
+  consumer): `Identity::load_hardware` takes an already-constructed
+  `YubiKeySigner` rather than a raw PIN, so `aivyx-federation` never
+  needs to know anything about PIN-acquisition UX — that lives entirely
+  in `aivyx`'s `aivyx federation yubikey-init` CLI subcommand, which
+  collects the PIN once at provisioning time. A different consumer is
+  free to make a different call.
