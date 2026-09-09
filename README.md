@@ -42,7 +42,7 @@ for the full account.
   see `CLAUDE.md`'s "Known, deliberately-undefended limitations" for why
   this is a deliberate deviation from the design spec worth a consumer's
   explicit attention.
-- Has **no knowledge of Aivyx's federation protocol** or any other
+- Has **no knowledge of Aivyx PA's federation protocol** or any other
   product concept — `aivyx-federation`'s `Identity` is the consumer that
   gives this primitive meaning.
 

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `aivyx-yubi` wraps a YubiKey's OpenPGP card applet for hardware-backed
 Ed25519 signing — card discovery, on-card key generation for the
 Signature slot, touch-policy configuration, PIN handling, and raw-byte
-signing. It has no knowledge of Aivyx's federation protocol or any
+signing. It has no knowledge of Aivyx PA's federation protocol or any
 other product-specific concept; `aivyx-federation`'s `Identity` is its
 first (and so far only) consumer.
 
@@ -55,10 +55,10 @@ documented follow-up, not something this crate's own CI/tests can prove.
   original `Identity::load_hardware(instance_id, binding_record)` sketch
   (`docs/superpowers/specs/2026-09-07-aivyx-yubi-design.md`), which took
   no PIN parameter at all and implied a prompt-capable flow.
-  **Resolved** in `aivyx` (Phase 208, 2026-09-08, the first real
+  **Resolved** in `aivyx-pa` (Phase 208, 2026-09-08, the first real
   consumer): `Identity::load_hardware` takes an already-constructed
   `YubiKeySigner` rather than a raw PIN, so `aivyx-federation` never
   needs to know anything about PIN-acquisition UX — that lives entirely
-  in `aivyx`'s `aivyx federation yubikey-init` CLI subcommand, which
+  in `aivyx-pa`'s `aivyx-pa federation yubikey-init` CLI subcommand, which
   collects the PIN once at provisioning time. A different consumer is
   free to make a different call.
