@@ -1,6 +1,26 @@
 //! `aivyx-yubi` — hardware-backed Ed25519 signing via a YubiKey's
 //! OpenPGP card applet. See `docs/superpowers/specs/
 //! 2026-09-07-aivyx-yubi-design.md` for the full design rationale.
+//!
+//! # Prefer [`YubiKeySigner`] over calling `discovery`/`provision`/`pin`
+//! # directly
+//!
+//! Those modules' public functions take a caller-supplied
+//! `&mut Card<Transaction<'_>>` and do nothing to stop a caller from
+//! opening a *second*, overlapping transaction on the same physical
+//! reader while the first is still held open. PC/SC has no reentrancy
+//! here — doing so deadlocks (`SCardBeginTransaction` blocks forever
+//! waiting for the first transaction to end, with no timeout). This is
+//! exactly the real bug `aivyx-pa`'s Phase 208 hit in its own CLI
+//! provisioning flow: it held one exclusive transaction open through key
+//! generation and touch-policy setup, then tried to open a second on the
+//! same reader for a "verification pass" — hanging forever, *after* the
+//! card had already been irreversibly re-keyed. [`YubiKeySigner`]
+//! avoids this whole hazard class by construction (see `sign.rs`'s own
+//! "holds no live card session" doc comment); a caller reaching for
+//! `discovery`/`provision`/`pin` directly takes on avoiding it the same
+//! way `sign.rs` does — one transaction open at a time, closed before
+//! the next begins.
 
 pub mod discovery;
 pub mod pin;

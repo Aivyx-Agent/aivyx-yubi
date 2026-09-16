@@ -39,6 +39,18 @@ documented follow-up, not something this crate's own CI/tests can prove.
 
 ## Known, deliberately-undefended limitations
 
+- The low-level `discovery`/`provision`/`pin` functions take a
+  caller-supplied `&mut Card<Transaction<'_>>` and don't themselves stop
+  a caller from opening a *second*, overlapping transaction on the same
+  reader while the first is still held — PC/SC deadlocks in that case
+  (`SCardBeginTransaction` blocks forever). This is exactly the real bug
+  `aivyx-pa`'s Phase 208 hit in its own CLI provisioning flow, after an
+  irreversible on-card re-key. `YubiKeySigner` avoids the hazard by
+  construction (see `sign.rs`'s "holds no live card session" doc
+  comment, and `lib.rs`'s crate-level doc comment for the full account)
+  — prefer it over the low-level modules directly. Not fixed at the
+  type level; documented as of a 2026-09-16 ecosystem documentation
+  audit, since it wasn't documented anywhere before that.
 - Requires `pcscd` — a real new system dependency for anyone using this
   crate, not required by any other Aivyx repo.
 - No PIV support. OpenPGP-applet-only; revisit if the `yubikey` crate
