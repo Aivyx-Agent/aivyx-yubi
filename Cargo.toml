@@ -3,7 +3,8 @@ name = "aivyx-yubi"
 description = "Hardware-backed Ed25519 signing via a YubiKey's OpenPGP card applet"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
+publish = false
 
 [dependencies]
 openpgp-card = "0.7"
