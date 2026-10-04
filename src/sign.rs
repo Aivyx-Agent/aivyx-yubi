@@ -313,6 +313,15 @@ impl YubiKeySigner {
         Self::from_open_card(card, user_pin)
     }
 
+    /// [`Self::new`], but bound to the attached card with this serial
+    /// rather than the first one enumerated — for a caller that already
+    /// knows which card it wants (e.g. a provisioning tool verifying the
+    /// card it just provisioned while other OpenPGP cards are attached).
+    pub fn new_for_serial(user_pin: SecretString, serial: &str) -> Result<Self, YubiError> {
+        let card = discovery::discover_real_card_by_serial(serial)?;
+        Self::from_open_card(card, user_pin)
+    }
+
     /// The testable core of [`Self::new`]: given an already-opened
     /// `Card<Open>` (real hardware via [`Self::new`], or
     /// [`crate::testing::FakeCard`] in this module's own tests), reads the
