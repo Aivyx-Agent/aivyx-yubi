@@ -184,6 +184,74 @@ pub enum YubiError {
     )]
     TouchPolicyNotEnforced,
 
+    /// [`sign::YubiKeySigner::new`]/`from_open_card` was given an empty
+    /// User PIN. Found live in `aivyx-pa`'s `yubikey-init`
+    /// (`aivyx-cli/.../federation.rs:236`, constructing
+    /// `YubiKeySigner::new(SecretString::from(String::new()))`) during the
+    /// 2026-10-04 audit: an empty PIN is certain to be rejected by the
+    /// card on the first real `sign()` call, so refusing it up front, at
+    /// construction, catches the mistake immediately rather than only on
+    /// first use (and before it can ever consume a real PIN retry -- see
+    /// [`PinIncorrect`]).
+    ///
+    /// [`PinIncorrect`]: YubiError::PinIncorrect
+    #[error("YubiKeySigner was constructed with an empty User PIN -- refusing before touching the card")]
+    EmptyPin,
+
+    /// A PIN's retry counter (`PWStatusBytes`, GET DATA tag `C4`) was
+    /// already below its maximum *before* this crate attempted anything
+    /// PIN-related. Returned by `pin::require_pin_retries_at_maximum`
+    /// (called first by `pin::require_pin_changed`, Finding I-4): reading
+    /// this counter needs no PIN itself, so checking it first means the
+    /// factory-default probe (which does spend a real retry per PIN, see
+    /// `pin.rs`'s doc comment) never becomes the attempt that blocks an
+    /// already-weakened PIN.
+    #[error(
+        "{pin_kind} PIN already has reduced retries ({retries_left}/{max_retries} remaining) -- \
+         refusing to spend any more of them by probing; check the card with \
+         `gpg --card-status` before proceeding"
+    )]
+    PinRetriesReduced {
+        /// Which PIN's counter is reduced: `"User"` or `"Admin"`.
+        pin_kind: &'static str,
+        /// The counter's current value, read straight from the card.
+        retries_left: u8,
+        /// The OpenPGP card spec's standard maximum (3) -- see
+        /// `pin::MAX_PIN_RETRIES`.
+        max_retries: u8,
+    },
+
+    /// `provision::generate_signature_key` refused: the Signature slot
+    /// already holds a key (Finding I-3). Call
+    /// `provision::generate_signature_key_overwriting` instead, once the
+    /// operator has explicitly confirmed that losing the existing key is
+    /// intended -- generating (or reconfiguring the algorithm for) a new
+    /// key irreversibly destroys whatever private key currently occupies
+    /// the slot, which may be a GPG signing key the cardholder already
+    /// relies on outside this crate.
+    #[error(
+        "the Signature slot already holds a key -- refusing to overwrite it; call \
+         `generate_signature_key_overwriting` instead once the operator has explicitly \
+         confirmed losing the existing key is intended"
+    )]
+    SignatureSlotOccupied,
+
+    /// `sign::YubiKeySigner::sign` found that the Signature slot's
+    /// *current* public key no longer matches the one this signer cached
+    /// at construction (Finding M-1). This means the slot was re-keyed
+    /// (deliberately or otherwise) after this `YubiKeySigner` was built:
+    /// continuing to sign would produce signatures from a *different*
+    /// private key than the one `public_key()` reports, which a peer
+    /// verifying against the stale cached key would silently reject with
+    /// no diagnosable cause. Re-construct the signer (`YubiKeySigner::new`)
+    /// to re-bind to the slot's current key.
+    #[error(
+        "the Signature slot's current public key no longer matches the one this signer was \
+         constructed against -- the slot was likely re-keyed; re-construct YubiKeySigner to \
+         re-bind to its current key before signing"
+    )]
+    SignatureKeyChanged,
+
     /// Catch-all for every other real error this crate's dependencies can
     /// report (raw APDU status words not covered above, transport
     /// failures unrelated to touch, etc).
@@ -208,7 +276,16 @@ impl From<openpgp_card::Error> for YubiError {
                 // This fallback deliberately doesn't guess a pin_kind and
                 // gives recovery guidance that's accurate for either case.
                 YubiError::PinBlocked {
-                    pin_kind: "A",
+                    // "Some" (not a guessed "User"/"Admin", and not the
+                    // bare, confusingly letter-like placeholder this used
+                    // to say -- see `pin_kind`'s own doc comment and the
+                    // audit's M4 finding): this call site genuinely has no
+                    // way to know which PIN blocked, and callers that *do*
+                    // know (`pin::verify_matches_default`,
+                    // `sign::map_signing_pin_error`) construct the
+                    // correctly-labeled variant directly instead of
+                    // reaching this fallback at all.
+                    pin_kind: "Some",
                     recovery_hint: "Check which PIN blocked: a blocked User PIN can be reset \
                                     via the Admin PIN's RESET RETRY COUNTER operation, but a \
                                     blocked Admin PIN cannot recover itself — that requires a \

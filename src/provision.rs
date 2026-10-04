@@ -127,7 +127,7 @@ use openpgp_card::{
         crypto::{EccType, PublicKeyMaterial},
         data::{Fingerprint, KeyGenerationTime, TouchPolicy},
     },
-    state::Admin,
+    state::{Admin, Transaction},
 };
 
 use crate::YubiError;
@@ -162,30 +162,81 @@ impl From<PublicKeyBytes> for [u8; 32] {
     }
 }
 
+/// True if the Signature slot already holds a key. Needs no PIN — reads
+/// back the slot's public key material (`Card<Transaction>::
+/// public_key_material`, the same real `GENERATE ASYMMETRIC KEY PAIR`
+/// read-mode call `sign.rs`'s `read_signature_public_key` uses), which the
+/// real card (and this crate's fake, see `testing.rs`) answers with the
+/// real `6A88 ReferencedDataNotFound` status word when no key has been
+/// generated yet, and the key material itself once one has. Added for
+/// Finding I-3 so [`generate_signature_key`] can refuse rather than
+/// silently overwrite, and so a provisioning tool (`discovery::
+/// list_cards`) can show the operator slot occupancy before they choose a
+/// card.
+pub fn signature_slot_has_key(tx: &mut Card<Transaction<'_>>) -> Result<bool, YubiError> {
+    match tx.public_key_material(KeyType::Signing) {
+        Ok(_) => Ok(true),
+        Err(OpenpgpError::CardStatus(StatusBytes::ReferencedDataNotFound)) => Ok(false),
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// Generate a fresh Ed25519 keypair on-card in the Signature slot,
-/// returning its raw 32-byte public key point.
+/// returning its raw 32-byte public key point — refusing if the slot
+/// already holds one (Finding I-3).
 ///
 /// `admin` must already be Admin-PIN-verified (PW3) — see this module's
 /// doc comment. On success, the card holds a new private key it never
 /// exposes; only the public key is returned.
+///
+/// # Refuses to overwrite an existing key (Finding I-3)
+///
+/// Many YubiKey owners keep a real GPG signing key in this slot, and
+/// [`generate_signature_key_overwriting`]'s underlying card operations
+/// destroy it irreversibly with no card-side "don't clobber" guard. This
+/// function checks [`signature_slot_has_key`] first and returns
+/// [`YubiError::SignatureSlotOccupied`] instead of proceeding if the slot
+/// is occupied. Call [`generate_signature_key_overwriting`] directly if
+/// the operator has explicitly confirmed that losing the existing key is
+/// intended — that function keeps this one's *previous*, unconditional
+/// behavior available under its own name.
+///
+/// [`YubiError::SignatureSlotOccupied`]: crate::YubiError::SignatureSlotOccupied
+pub fn generate_signature_key(
+    admin: &mut Card<Admin<'_, '_>>,
+) -> Result<PublicKeyBytes, YubiError> {
+    if signature_slot_has_key(admin.as_transaction())? {
+        return Err(YubiError::SignatureSlotOccupied);
+    }
+    generate_signature_key_overwriting(admin)
+}
+
+/// [`generate_signature_key`], but without the occupancy check: always
+/// generates a fresh Ed25519 keypair in the Signature slot, silently
+/// destroying any key already there. This is this function's *entire*
+/// previous behavior before Finding I-3, kept available under this
+/// explicit name for a caller that has already gotten the operator's
+/// explicit confirmation that overwriting is intended — e.g. after
+/// checking [`signature_slot_has_key`] itself and prompting.
 ///
 /// Configures the Signature slot's algorithm to Ed25519/EdDSA
 /// (`AlgoSimple::Curve25519`) before generating, since a factory-default
 /// card's Signature slot is RSA2048, not Ed25519 — see this module's doc
 /// comment for the real-API finding behind this.
 ///
+/// `admin` must already be Admin-PIN-verified (PW3) — see this module's
+/// doc comment.
+///
 /// # This is destructive if the slot already holds a key
 ///
 /// `set_algorithm`'s underlying `PUT DATA` write resets the Signature
 /// slot on real hardware, and `generate_key` overwrites whatever private
 /// key currently occupies it — there is no card-side "don't clobber an
-/// existing key" guard. Per this crate's design spec, provisioning is a
-/// one-time operation performed against a freshly-reset or never-before-
-/// provisioned card, so this is accepted rather than defended against in
-/// code. Callers (including the CLI provisioning flow) must not call this
-/// idempotently or accidentally against a card that already has a
-/// Signature-slot key they care about — doing so silently destroys it.
-pub fn generate_signature_key(
+/// existing key" guard. Callers must not call this idempotently or
+/// accidentally against a card that already has a Signature-slot key
+/// they care about — doing so silently destroys it. Prefer
+/// [`generate_signature_key`] unless overwriting is explicitly intended.
+pub fn generate_signature_key_overwriting(
     admin: &mut Card<Admin<'_, '_>>,
 ) -> Result<PublicKeyBytes, YubiError> {
     admin
@@ -367,6 +418,70 @@ mod tests {
         let err = set_signature_touch_policy_fixed(&mut admin)
             .expect_err("setting touch policy without a verified admin PIN should be rejected");
 
+        assert!(matches!(err, YubiError::AdminAuthRequired));
+    }
+
+    #[test]
+    fn signature_slot_has_key_is_false_on_a_fresh_card() {
+        let mut card = admin_authenticated_card();
+        let mut tx = card.transaction().unwrap();
+
+        assert!(!signature_slot_has_key(&mut tx).unwrap());
+    }
+
+    #[test]
+    fn signature_slot_has_key_is_true_after_generation() {
+        let mut card = admin_authenticated_card();
+        let mut tx = card.transaction().unwrap();
+        let admin_pin = SecretString::from(pin::FACTORY_DEFAULT_ADMIN_PIN);
+        let mut admin = tx.as_admin_card(admin_pin).unwrap();
+        generate_signature_key(&mut admin).expect("key generation should succeed");
+
+        // `admin` borrows `tx`; NLL ends that borrow here (same pattern as
+        // `sets_the_signature_touch_policy_to_fixed` above).
+        assert!(signature_slot_has_key(&mut tx).unwrap());
+    }
+
+    #[test]
+    fn generate_signature_key_refuses_when_the_slot_already_holds_a_key() {
+        // Finding I-3: many YubiKey owners keep a real GPG signing key in
+        // this slot. `generate_signature_key` (the name every existing
+        // caller, including aivyx-pa, already calls) must refuse rather
+        // than silently destroy it.
+        let mut card = admin_authenticated_card();
+        let mut tx = card.transaction().unwrap();
+        let admin_pin = SecretString::from(pin::FACTORY_DEFAULT_ADMIN_PIN);
+        let mut admin = tx.as_admin_card(admin_pin).unwrap();
+        generate_signature_key(&mut admin).expect("the first generation should succeed");
+
+        let err = generate_signature_key(&mut admin)
+            .expect_err("generating again against an occupied slot must be refused");
+        assert!(matches!(err, YubiError::SignatureSlotOccupied));
+    }
+
+    #[test]
+    fn generate_signature_key_overwriting_replaces_an_existing_key() {
+        // The escape hatch: the pre-Finding-I-3 unconditional-overwrite
+        // behavior, kept available under an explicit name for a caller
+        // that has already gotten the operator's explicit confirmation.
+        let mut card = admin_authenticated_card();
+        let mut tx = card.transaction().unwrap();
+        let admin_pin = SecretString::from(pin::FACTORY_DEFAULT_ADMIN_PIN);
+        let mut admin = tx.as_admin_card(admin_pin).unwrap();
+        generate_signature_key(&mut admin).expect("the first generation should succeed");
+
+        generate_signature_key_overwriting(&mut admin)
+            .expect("overwriting an occupied slot should still succeed via the explicit API");
+    }
+
+    #[test]
+    fn generate_signature_key_overwriting_without_admin_auth_is_rejected() {
+        let mut card = admin_authenticated_card();
+        let mut tx = card.transaction().unwrap();
+        let mut admin = tx.as_admin_card(None::<SecretString>).unwrap();
+
+        let err = generate_signature_key_overwriting(&mut admin)
+            .expect_err("overwriting without a verified admin PIN should be rejected");
         assert!(matches!(err, YubiError::AdminAuthRequired));
     }
 }

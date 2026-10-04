@@ -55,6 +55,14 @@ pub const FACTORY_DEFAULT_USER_PIN: &str = "123456";
 /// module's doc comment for where this is grounded.
 pub const FACTORY_DEFAULT_ADMIN_PIN: &str = "12345678";
 
+/// The OpenPGP card spec's standard retry-counter maximum for both PW1
+/// (User) and PW3 (Admin) on essentially all real cards, including every
+/// YubiKey -- `PWStatusBytes` (GET DATA tag `C4`) reports *how many
+/// retries remain*, not a card-reported maximum, so this crate hardcodes
+/// the spec's own value rather than inventing a way to ask the card for
+/// it. Used by [`require_pin_retries_at_maximum`].
+pub const MAX_PIN_RETRIES: u8 = 3;
+
 /// Which PIN a [`verify_matches_default`] call is checking — needed so a
 /// blocked-PIN outcome can be reported as the correctly-labeled
 /// [`YubiError::PinBlocked`] variant (see that variant's doc comment for
@@ -114,6 +122,47 @@ pub fn is_pin_factory_default(tx: &mut Card<Transaction<'_>>) -> Result<bool, Yu
     Ok(user_is_default || admin_is_default)
 }
 
+/// Read both PINs' current retry counters straight from the card's
+/// `PWStatusBytes` (GET DATA tag `C4`) -- a plain cached-ART read that
+/// presents no PIN and spends no retry at all, unlike
+/// [`is_pin_factory_default`]. Returns `(pw1_retries_left,
+/// pw3_retries_left)`.
+pub fn pin_retries(tx: &mut Card<Transaction<'_>>) -> Result<(u8, u8), YubiError> {
+    let pw_status = tx.pw_status_bytes()?;
+    Ok((pw_status.err_count_pw1(), pw_status.err_count_pw3()))
+}
+
+/// Refuse to proceed if either PIN's retry counter is already below its
+/// maximum ([`MAX_PIN_RETRIES`]) -- i.e. some previous attempt (by this
+/// crate, by `gpg`, by the operator fat-fingering a PIN pad, ...) already
+/// spent a retry, so this crate's own factory-default probe (which always
+/// spends one more per PIN, see this module's doc comment) must not be
+/// the one that walks either PIN the rest of the way to blocked
+/// (Finding I-4). Checked first by [`require_pin_changed`], and exposed
+/// here directly for a caller (e.g. a CLI provisioning flow) that wants
+/// to check before doing anything else PIN-related at all.
+///
+/// Reports the User PIN's reduced count first if both are reduced --
+/// arbitrary, but deterministic.
+pub fn require_pin_retries_at_maximum(tx: &mut Card<Transaction<'_>>) -> Result<(), YubiError> {
+    let (pw1, pw3) = pin_retries(tx)?;
+    if pw1 < MAX_PIN_RETRIES {
+        return Err(YubiError::PinRetriesReduced {
+            pin_kind: "User",
+            retries_left: pw1,
+            max_retries: MAX_PIN_RETRIES,
+        });
+    }
+    if pw3 < MAX_PIN_RETRIES {
+        return Err(YubiError::PinRetriesReduced {
+            pin_kind: "Admin",
+            retries_left: pw3,
+            max_retries: MAX_PIN_RETRIES,
+        });
+    }
+    Ok(())
+}
+
 /// [`is_pin_factory_default`], but returns a provisioning-blocking
 /// [`YubiError::PinStillFactoryDefault`] instead of `Ok(true)` — the
 /// entry point provisioning flows should call, per this crate's design
@@ -140,7 +189,19 @@ pub fn is_pin_factory_default(tx: &mut Card<Transaction<'_>>) -> Result<bool, Yu
 /// lockout it exists to prevent.
 ///
 /// [`YubiError::PinBlocked`]: crate::YubiError::PinBlocked
+///
+/// # Checks retry counters first (Finding I-4)
+///
+/// Calls [`require_pin_retries_at_maximum`] before doing anything else:
+/// if either PIN's retry counter is already reduced, this refuses with
+/// [`YubiError::PinRetriesReduced`] instead of running the factory-default
+/// probe at all -- the probe itself spends a real retry per PIN (see this
+/// module's doc comment), so it must never be the attempt that finishes
+/// blocking an already-weakened PIN.
+///
+/// [`YubiError::PinRetriesReduced`]: crate::YubiError::PinRetriesReduced
 pub fn require_pin_changed(tx: &mut Card<Transaction<'_>>) -> Result<(), YubiError> {
+    require_pin_retries_at_maximum(tx)?;
     if is_pin_factory_default(tx)? {
         return Err(YubiError::PinStillFactoryDefault);
     }
@@ -213,13 +274,26 @@ mod tests {
 
     #[test]
     fn both_pins_changed_are_reported_as_not_default() {
-        let fake = FakeCard::new()
-            .with_changed_user_pin(b"000000")
-            .with_changed_admin_pin(b"00000000");
-        let mut card = Card::new(fake).unwrap();
-        let mut tx = card.transaction().unwrap();
+        // Two independent, freshly-constructed cards (not one card probed
+        // twice): since Finding I-4, each probe below spends a real retry
+        // off both PINs, and this module's own guidance (see its doc
+        // comment) is to call these functions once per attempt, not
+        // repeatedly against the same card -- a second probe against an
+        // already-probed card would now correctly refuse via
+        // `require_pin_retries_at_maximum` instead of reaching the
+        // factory-default check at all.
+        let fresh_fake = || {
+            FakeCard::new()
+                .with_changed_user_pin(b"000000")
+                .with_changed_admin_pin(b"00000000")
+        };
 
+        let mut card = Card::new(fresh_fake()).unwrap();
+        let mut tx = card.transaction().unwrap();
         assert!(!is_pin_factory_default(&mut tx).unwrap());
+
+        let mut card = Card::new(fresh_fake()).unwrap();
+        let mut tx = card.transaction().unwrap();
         assert!(require_pin_changed(&mut tx).is_ok());
     }
 
@@ -291,5 +365,133 @@ mod tests {
                 panic!("expected YubiError::PinBlocked{{pin_kind: \"Admin\", ..}}, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn pin_retries_reports_the_maximum_on_a_fresh_card() {
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+
+        assert_eq!(pin_retries(&mut tx).unwrap(), (3, 3));
+    }
+
+    #[test]
+    fn require_pin_retries_at_maximum_passes_on_a_fresh_card() {
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+
+        assert!(require_pin_retries_at_maximum(&mut tx).is_ok());
+    }
+
+    #[test]
+    fn require_pin_retries_at_maximum_refuses_when_the_user_pin_is_reduced() {
+        // Finding I-4: a prior wrong User-PIN VERIFY (simulating an
+        // operator mistyping it, or an earlier provisioning attempt)
+        // already spent one of PW1's 3 real retries -- probing further
+        // (the factory-default check) must be refused instead of risking
+        // walking it the rest of the way to blocked.
+        //
+        // Two separate `Card::new` sessions sharing one `FakeCard`'s
+        // underlying state (clones share state -- see `FakeCard`'s own
+        // doc comment), not one session probed twice: `openpgp-card`
+        // caches Application Related Data (which `PWStatusBytes` is part
+        // of) at `Card::new`'s SELECT and only invalidates that cache on
+        // a *successful* VERIFY (confirmed directly against
+        // `openpgp-card-0.7.0/src/lib.rs`'s `verify_user_pin`: the `?` on
+        // a failed `verify_pw1_user` returns before reaching
+        // `invalidate_cache_ard()`) -- so a wrong VERIFY and the
+        // retry-counter read that should observe it must go through two
+        // separate SELECTs, exactly like two separate real-world
+        // process runs would.
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake.clone()).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let _ = tx.verify_user_pin(SecretString::from("000000")); // wrong on purpose
+        drop(tx);
+        drop(card);
+
+        let mut card = Card::new(fake).unwrap(); // fresh SELECT, fresh ART read
+        let mut tx = card.transaction().unwrap();
+        let err = require_pin_retries_at_maximum(&mut tx).unwrap_err();
+        match err {
+            YubiError::PinRetriesReduced {
+                pin_kind,
+                retries_left,
+                max_retries,
+            } => {
+                assert_eq!(pin_kind, "User");
+                assert_eq!(retries_left, 2);
+                assert_eq!(max_retries, MAX_PIN_RETRIES);
+            }
+            other => panic!("expected YubiError::PinRetriesReduced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_pin_retries_at_maximum_refuses_when_the_admin_pin_is_reduced() {
+        // See the previous test's comment on why this needs two separate
+        // `Card::new` sessions.
+        let fake = FakeCard::new();
+        let mut card = Card::new(fake.clone()).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let _ = tx.verify_admin_pin(SecretString::from("00000000")); // wrong on purpose
+        drop(tx);
+        drop(card);
+
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let err = require_pin_retries_at_maximum(&mut tx).unwrap_err();
+        match err {
+            YubiError::PinRetriesReduced {
+                pin_kind,
+                retries_left,
+                ..
+            } => {
+                assert_eq!(pin_kind, "Admin");
+                assert_eq!(retries_left, 2);
+            }
+            other => panic!("expected YubiError::PinRetriesReduced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_pin_changed_refuses_before_probing_when_retries_already_reduced() {
+        // The whole point of Finding I-4: once a PIN's retries are
+        // already reduced, `require_pin_changed` must refuse via
+        // `require_pin_retries_at_maximum` *before* ever running the
+        // factory-default probe -- which would otherwise spend yet
+        // another retry (this crate's own `is_pin_factory_default`, not
+        // the operator). Proven here by asserting the retry count is
+        // unchanged after the call: if the probe had run, a non-default
+        // User PIN would make its own default-VERIFY attempt wrong too,
+        // decrementing the counter again. Two separate `Card::new`
+        // sessions -- see the first test above's comment on why.
+        let fake = FakeCard::new().with_changed_user_pin(b"000000");
+        let mut card = Card::new(fake.clone()).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let _ = tx.verify_user_pin(SecretString::from("999999")); // one wrong attempt, on purpose
+        drop(tx);
+        drop(card);
+
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+        assert_eq!(pin_retries(&mut tx).unwrap().0, 2);
+
+        let err = require_pin_changed(&mut tx).unwrap_err();
+        assert!(matches!(
+            err,
+            YubiError::PinRetriesReduced {
+                pin_kind: "User",
+                retries_left: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            pin_retries(&mut tx).unwrap().0,
+            2,
+            "require_pin_changed must not have run the factory-default probe at all"
+        );
     }
 }

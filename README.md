@@ -36,9 +36,26 @@ for the full account.
 - Sets the Signature slot's touch-policy to fixed/always-on: every
   signature requires a physical tap.
 - Refuses to provision a key while the card's PIN is still the
-  well-known factory default (`123456`).
+  well-known factory default (`123456`), and refuses to even probe for
+  that if either PIN's retry counter is already reduced (check the card
+  with `gpg --card-status` first in that case).
+- Refuses to generate a new Signature-slot key if the slot already holds
+  one, unless the caller explicitly opts into overwriting it
+  (`provision::generate_signature_key_overwriting`) — many YubiKey owners
+  keep a real GPG signing key in this slot, and losing it is irreversible.
+- **Writes a non-standard key fingerprint to the slot.** The on-card
+  fingerprint this crate stores alongside a newly-generated key (GET DATA
+  tag `C5`) is *not* a real OpenPGP v4 fingerprint (RFC 4880 §12.2) — this
+  crate never builds or exports actual OpenPGP certificates, so it uses a
+  simple placeholder instead (see `provision.rs`'s `key_slot_fingerprint`
+  doc comment). Running `gpg --card-status` against a card provisioned by
+  this crate will show a fingerprint that matches no real certificate —
+  expected, not a bug, but worth knowing if you also use the card with
+  GnuPG for anything else.
 - Signs arbitrary byte messages, returning a raw 64-byte Ed25519
-  signature.
+  signature. Finds the right card by serial among several attached
+  devices, and stops presenting the User PIN again (failing immediately
+  instead) once the card has rejected it once.
 - Caches the User PIN in process memory for a `YubiKeySigner`'s entire
   lifetime (re-presented to the card on every signature, but the operator
   is only re-touched, not re-prompted for the PIN, after construction) —

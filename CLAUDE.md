@@ -63,7 +63,12 @@ documented follow-up, not something this crate's own CI/tests can prove.
   process memory for its entire lifetime, re-presenting it to the card
   fresh on every `sign()` call — but the operator is only re-touched, not
   re-prompted for the PIN, after construction (see `sign.rs`'s own
-  rustdoc). This is a **deliberate deviation** from the design spec's
+  rustdoc). As of the 2026-10-04 audit (Finding I-1), an empty PIN is
+  rejected at construction, and a PIN the card rejects once latches the
+  signer: every later `sign()` fails immediately with that same error
+  without presenting the PIN to the card again, so a caller that retries
+  can no longer walk the User PIN toward a card-side block. This is a
+  **deliberate deviation** from the design spec's
   original `Identity::load_hardware(instance_id, binding_record)` sketch
   (`docs/superpowers/specs/2026-09-07-aivyx-yubi-design.md`), which took
   no PIN parameter at all and implied a prompt-capable flow.

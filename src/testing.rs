@@ -168,13 +168,16 @@
 //!   these two strings as its current PW1/PW3 values;
 //!   [`FakeCard::with_changed_user_pin`]/[`FakeCard::with_changed_admin_pin`]
 //!   simulate a PIN change by overwriting them.
-//! - **Retry counters in the cached ART are static**, not synced with the
-//!   fake's own live VERIFY retry tracking. A test that verifies with a
-//!   wrong PIN twice and then reads `pw_status_bytes()` will still see the
-//!   fixture's fixed `err_count_pw1 = 3`. Tests that care about retries
-//!   remaining should assert on the real status word `openpgp-card` surfaces
-//!   from the failed `VERIFY` itself (`StatusBytes::PasswordNotChecked(n)`,
-//!   real enum, real mapping — see point 4), not on `pw_status_bytes()`.
+//! - **Retry counters in the cached ART now reflect live state** (fixed as
+//!   part of `fix/card-safety`, needed to test `pin::require_pin_retries_at_
+//!   maximum`): `GET DATA` tag `C4`'s `err_count_pw1`/`err_count_pw3` bytes
+//!   are built from [`PinSlot::retries_left`] at response time, not a fixed
+//!   `3`/`3`. A test that verifies with a wrong PIN and then reads
+//!   `pw_status_bytes()` now sees the real, decremented count. (Previously
+//!   static — this module's own earlier note said tests needing retry state
+//!   should assert on the `VERIFY` status word instead; that limitation is
+//!   gone, though asserting on the status word directly, as the existing
+//!   `pin.rs`/`sign.rs` tests do, remains equally valid.)
 //! - **Touch timeout** is modeled as a *transport*-level failure (`Err(
 //!   SmartcardError::Error(..))` from `transmit()`), matching one of the
 //!   two real shapes a touch timeout can plausibly take — a PC/SC reader
@@ -210,16 +213,21 @@
 //!   reset/power-cycle, not per logical PC/SC transaction) chosen because
 //!   `transaction()` is the only session boundary the `CardBackend` trait
 //!   itself exposes.
-//! - **[`FakeCard::is_default_pins`]/[`FakeCard::signing_key_generated`]
-//!   are unreachable once the fake is boxed**: `Card::new(fake_card)`
-//!   moves the fake into an opaque `Box<dyn CardBackend + Send + Sync>`
-//!   with no handle retained, so nothing can call these `&self` inspection
-//!   methods again afterwards. A caller that needs to inspect fake state
-//!   post-construction currently has no way to; wrapping the mutable
-//!   state in `Arc<Mutex<..>>` internally (so a cheap clone of the shared
-//!   handle could be retained before the move) would fix this, but is
-//!   left as a known limitation for a later task to pick up if it turns
-//!   out to be needed, rather than speculatively adding now.
+//! - **[`FakeCard`]'s state now lives behind a shared `Arc<Mutex<Inner>>`**
+//!   (fixed as part of `fix/card-safety`), so [`FakeCard`] itself is
+//!   `Clone` and a clone taken *before* the original is moved into
+//!   `Card::new` (which still boxes that original into an opaque
+//!   `Box<dyn CardBackend + Send + Sync>`) keeps working: calling
+//!   [`FakeCard::is_default_pins`]/[`FakeCard::signing_key_generated`]/
+//!   [`FakeCard::last_signed_data`]/[`FakeCard::user_pin_retries_left`]/
+//!   [`FakeCard::admin_pin_retries_left`] on the clone still observes live
+//!   state. This also means two *separate* `Card::new(..)` instances built
+//!   from clones of the same `FakeCard` share PIN/retry/key state, the same
+//!   way two separate PC/SC transactions against one physical card would —
+//!   needed so a test can exercise `YubiKeySigner::sign()`'s PIN-retry latch
+//!   (2026-10-04 audit, Finding I-1, `sign.rs`) across *multiple*, independent `sign()` calls
+//!   (each of which re-discovers a fresh `Card<Open>`) against what is
+//!   meant to be one physical card, not a fresh one each time.
 
 use std::sync::{Arc, Mutex};
 
@@ -335,6 +343,8 @@ fn build_application_related_data(
     serial: u32,
     uif_sig: [u8; 2],
     algo_sig: &[u8],
+    retries_pw1: u8,
+    retries_pw3: u8,
 ) -> Vec<u8> {
     // Application Identifier (tag 4F). Layout grounded in
     // `ocard/data/application_id.rs::parse`: `d2 76 00 01 24` fixed prefix,
@@ -360,9 +370,13 @@ fn build_application_related_data(
     let algo_other = ALGO_ATTRS_RSA2048;
 
     // PW Status Bytes (tag C4, must be exactly 7 bytes per
-    // `ocard/data/pw_status.rs`). Real YubiKey 5 fixture values: PW1 not
-    // "valid once", max lengths 127/127/127, 3 retries each.
-    let pw_status = [0xff, 0x7f, 0x7f, 0x7f, 0x03, 0x00, 0x03];
+    // `ocard/data/pw_status.rs`). Real YubiKey 5 fixture values for the
+    // fixed bytes: PW1 not "valid once", max lengths 127/127/127. The
+    // retry-count bytes (`err_count_pw1`/`err_count_pw3`) reflect this
+    // fake's own *live* `PinSlot::retries_left` state (passed in by the
+    // caller) rather than a fixed `3`/`3` — see this module's doc comment,
+    // section 5, "Retry counters in the cached ART now reflect live state".
+    let pw_status = [0xff, 0x7f, 0x7f, 0x7f, retries_pw1, 0x00, retries_pw3];
 
     // Fingerprints (tag C5) and generation times (tag CD): all-zero, i.e.
     // "no key in this slot yet" (`ocard/data/fingerprint.rs`,
@@ -480,14 +494,10 @@ impl PinSlot {
     }
 }
 
-/// A fake OpenPGP card, standing in for real YubiKey hardware. Implements
-/// [`card_backend::CardBackend`]; see this module's own doc comment for how
-/// that trait was grounded and what its responses do and don't simulate.
-///
-/// Build one with [`FakeCard::new`] (a fresh, present card with
-/// factory-default PINs and no generated keys), then hand it to
-/// `openpgp_card::Card::new(fake_card)`.
-pub struct FakeCard {
+/// [`FakeCard`]'s live, shared state. See [`FakeCard`]'s own doc comment
+/// for why this lives behind an `Arc<Mutex<..>>` rather than directly on
+/// [`FakeCard`].
+struct Inner {
     present: bool,
     broken: bool,
     manufacturer: u16,
@@ -507,7 +517,7 @@ pub struct FakeCard {
     algo_sig: Vec<u8>,
     signing_key_generated: bool,
     touch_timeout: bool,
-    /// See [`Self::with_card_removed_mid_signature`].
+    /// See [`FakeCard::with_card_removed_mid_signature`].
     card_removed_mid_signature: bool,
     /// PW1 (signing mode, VERIFY P2 `0x81`) has been successfully
     /// verified in the current session. Gates `PSO: COMPUTE DIGITAL
@@ -518,15 +528,35 @@ pub struct FakeCard {
     /// this module's doc comment, section 5.
     verified_pw3_admin: bool,
     /// The exact data field of the last `PSO: COMPUTE DIGITAL SIGNATURE`
-    /// this fake received, if any. Shared via `Arc<Mutex<..>>` (rather
-    /// than a plain field) so a test can keep a cheap clone of the handle
-    /// — via [`Self::last_signed_data_handle`] — *before* moving this fake
-    /// into `Card::new` (which boxes it with no handle retained, see this
-    /// module's doc comment, section 5) and still inspect it afterward.
-    /// Exists to prove the real signing code path (`sign.rs`) sends the
-    /// raw message unmodified, not a hash or digest — see this module's
-    /// doc comment, "Finding I-2".
-    last_signed_data: Arc<Mutex<Vec<u8>>>,
+    /// this fake received, if any. Exists to prove the real signing code
+    /// path (`sign.rs`) sends the raw message unmodified, not a hash or
+    /// digest — see this module's doc comment, "Finding I-2".
+    last_signed_data: Vec<u8>,
+}
+
+/// A fake OpenPGP card, standing in for real YubiKey hardware. Implements
+/// [`card_backend::CardBackend`]; see this module's own doc comment for how
+/// that trait was grounded and what its responses do and don't simulate.
+///
+/// Build one with [`FakeCard::new`] (a fresh, present card with
+/// factory-default PINs and no generated keys), then hand it to
+/// `openpgp_card::Card::new(fake_card)`.
+///
+/// `Clone`: cheap — clones share the same underlying [`Inner`] via
+/// `Arc<Mutex<..>>`. Two independent reasons want this: (1) a test needs
+/// to inspect a fake's live state (`is_default_pins`,
+/// `signing_key_generated`, `last_signed_data`, the PIN-retry accessors,
+/// ...) *after* the original has been moved into `Card::new` (which boxes
+/// it with no handle retained) — clone before the move, inspect the clone
+/// after; (2) a test needs *two or more separately-discovered*
+/// `Card<Open>` instances (e.g. across repeated `YubiKeySigner::sign()`
+/// calls, which each re-discover a fresh card) to behave like the *same*
+/// physical card, sharing PIN-retry state the way a real card would
+/// across separate PC/SC transactions — build each `Card::new(..)` from a
+/// separate clone of one `FakeCard`.
+#[derive(Clone)]
+pub struct FakeCard {
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl FakeCard {
@@ -535,20 +565,22 @@ impl FakeCard {
     /// signing, and a real Yubico manufacturer id with a fixed serial.
     pub fn new() -> Self {
         Self {
-            present: true,
-            broken: false,
-            manufacturer: 0x0006, // "Yubico AB", per `ApplicationIdentifier::manufacturer_name`
-            serial: 0x0011_2233,
-            pw1: PinSlot::new(FACTORY_DEFAULT_USER_PIN),
-            pw3: PinSlot::new(FACTORY_DEFAULT_ADMIN_PIN),
-            uif_sig: [0x00, 0x20], // TouchPolicy::Off, Features::Button
-            algo_sig: ALGO_ATTRS_RSA2048.to_vec(),
-            signing_key_generated: false,
-            touch_timeout: false,
-            card_removed_mid_signature: false,
-            verified_pw1_sign: false,
-            verified_pw3_admin: false,
-            last_signed_data: Arc::new(Mutex::new(Vec::new())),
+            inner: Arc::new(Mutex::new(Inner {
+                present: true,
+                broken: false,
+                manufacturer: 0x0006, // "Yubico AB", per `ApplicationIdentifier::manufacturer_name`
+                serial: 0x0011_2233,
+                pw1: PinSlot::new(FACTORY_DEFAULT_USER_PIN),
+                pw3: PinSlot::new(FACTORY_DEFAULT_ADMIN_PIN),
+                uif_sig: [0x00, 0x20], // TouchPolicy::Off, Features::Button
+                algo_sig: ALGO_ATTRS_RSA2048.to_vec(),
+                signing_key_generated: false,
+                touch_timeout: false,
+                card_removed_mid_signature: false,
+                verified_pw1_sign: false,
+                verified_pw3_admin: false,
+                last_signed_data: Vec::new(),
+            })),
         }
     }
 
@@ -557,8 +589,8 @@ impl FakeCard {
     /// `card-backend-pcsc` itself surfaces "no card" (`SmartcardError::
     /// CardNotFound`, see this module's doc comment point 5).
     pub fn absent() -> Self {
-        let mut card = Self::new();
-        card.present = false;
+        let card = Self::new();
+        card.inner.lock().unwrap().present = false;
         card
     }
 
@@ -573,8 +605,8 @@ impl FakeCard {
     /// sent. Added to exercise `discovery::discover_card_from`'s
     /// "found-but-broken vs. truly absent" distinction.
     pub fn broken() -> Self {
-        let mut card = Self::new();
-        card.broken = true;
+        let card = Self::new();
+        card.inner.lock().unwrap().broken = true;
         card
     }
 
@@ -582,15 +614,15 @@ impl FakeCard {
     /// factory default has been changed. Fake-only setup helper — see this
     /// module's doc comment point 5 for why there's no real-protocol way to
     /// query "is this still the default".
-    pub fn with_changed_user_pin(mut self, new_pin: &[u8]) -> Self {
-        self.pw1 = PinSlot::new(new_pin);
+    pub fn with_changed_user_pin(self, new_pin: &[u8]) -> Self {
+        self.inner.lock().unwrap().pw1 = PinSlot::new(new_pin);
         self
     }
 
     /// Overwrite this card's current Admin PIN (PW3). See
     /// [`Self::with_changed_user_pin`].
-    pub fn with_changed_admin_pin(mut self, new_pin: &[u8]) -> Self {
-        self.pw3 = PinSlot::new(new_pin);
+    pub fn with_changed_admin_pin(self, new_pin: &[u8]) -> Self {
+        self.inner.lock().unwrap().pw3 = PinSlot::new(new_pin);
         self
     }
 
@@ -601,8 +633,8 @@ impl FakeCard {
     /// confirmed against `card-backend-pcsc-0.5.2/src/lib.rs`'s
     /// `PcscTransaction::transmit` — see `sign.rs`'s doc comment), rather
     /// than the card returning any status word.
-    pub fn with_touch_timeout(mut self) -> Self {
-        self.touch_timeout = true;
+    pub fn with_touch_timeout(self) -> Self {
+        self.inner.lock().unwrap().touch_timeout = true;
         self
     }
 
@@ -613,17 +645,18 @@ impl FakeCard {
     /// [`Self::with_touch_timeout`]'s `Timeout` case). Added for Finding
     /// I-1(a): this must NOT be mapped to `YubiError::TouchTimeout` by
     /// `sign::map_sign_error`, unlike the touch-timeout fixture above.
-    pub fn with_card_removed_mid_signature(mut self) -> Self {
-        self.card_removed_mid_signature = true;
+    pub fn with_card_removed_mid_signature(self) -> Self {
+        self.inner.lock().unwrap().card_removed_mid_signature = true;
         self
     }
 
     /// Override this card's serial (keeping the fixed Yubico manufacturer
     /// id). Fake-only setup helper for simulating a *different* physical
     /// card than the one a `YubiKeySigner` was originally constructed
-    /// against — see `sign.rs`'s Finding I-3 tests.
-    pub fn with_serial(mut self, serial: u32) -> Self {
-        self.serial = serial;
+    /// against — see `sign.rs`'s Finding I-3 tests, and `discovery.rs`'s
+    /// multi-card-by-serial tests.
+    pub fn with_serial(self, serial: u32) -> Self {
+        self.inner.lock().unwrap().serial = serial;
         self
     }
 
@@ -632,14 +665,30 @@ impl FakeCard {
     /// 5. Provided so tests can assert on fixture *intent* without also
     /// hardcoding the default PIN bytes at every call site.
     pub fn is_default_pins(&self) -> bool {
-        self.pw1.current == FACTORY_DEFAULT_USER_PIN
-            && self.pw3.current == FACTORY_DEFAULT_ADMIN_PIN
+        let inner = self.inner.lock().unwrap();
+        inner.pw1.current == FACTORY_DEFAULT_USER_PIN && inner.pw3.current == FACTORY_DEFAULT_ADMIN_PIN
     }
 
     /// Fake-only accessor: has a signing key been generated on this fake
     /// card yet (i.e. did a `GENERATE ASYMMETRIC KEY PAIR` succeed)?
     pub fn signing_key_generated(&self) -> bool {
-        self.signing_key_generated
+        self.inner.lock().unwrap().signing_key_generated
+    }
+
+    /// Fake-only accessor: the User PIN's (PW1) current live retry count,
+    /// as tracked by this fake's own [`PinSlot`] (not the static-until-now
+    /// `PWStatusBytes` byte — see this module's doc comment, section 5).
+    /// Added for `sign.rs`'s PIN-retry-latch tests (2026-10-04 audit, Finding I-1): proves a
+    /// latched `YubiKeySigner` stops spending real retries after its first
+    /// rejection.
+    pub fn user_pin_retries_left(&self) -> u8 {
+        self.inner.lock().unwrap().pw1.retries_left
+    }
+
+    /// Fake-only accessor: the Admin PIN's (PW3) current live retry count.
+    /// See [`Self::user_pin_retries_left`].
+    pub fn admin_pin_retries_left(&self) -> u8 {
+        self.inner.lock().unwrap().pw3.retries_left
     }
 
     /// The fabricated Ed25519 public key point a successful key generation
@@ -656,13 +705,13 @@ impl FakeCard {
         FAKE_ED25519_SIGNATURE
     }
 
-    /// A cheap clone of the shared handle recording the exact data field
-    /// of the last `PSO: COMPUTE DIGITAL SIGNATURE` this fake received.
-    /// Call this *before* moving the fake into `Card::new` (which boxes it
-    /// with no handle retained — see this module's doc comment, section
-    /// 5) to still be able to inspect it afterward.
-    pub fn last_signed_data_handle(&self) -> Arc<Mutex<Vec<u8>>> {
-        Arc::clone(&self.last_signed_data)
+    /// The exact data field of the last `PSO: COMPUTE DIGITAL SIGNATURE`
+    /// this fake received, if any. Clone this `FakeCard` *before* moving
+    /// the original into `Card::new` (which boxes it with no handle
+    /// retained — see this struct's own doc comment) to still be able to
+    /// inspect it afterward via the clone.
+    pub fn last_signed_data(&self) -> Vec<u8> {
+        self.inner.lock().unwrap().last_signed_data.clone()
     }
 }
 
@@ -692,7 +741,8 @@ impl CardBackend for FakeCard {
         &mut self,
         _reselect_application: Option<&[u8]>,
     ) -> Result<Box<dyn CardTransaction + Send + Sync + '_>, SmartcardError> {
-        if !self.present {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.present {
             return Err(SmartcardError::CardNotFound(
                 "fake card is absent".to_string(),
             ));
@@ -700,19 +750,26 @@ impl CardBackend for FakeCard {
         // A fresh transaction is this fake's session boundary: PIN
         // verification doesn't carry over (see this module's doc
         // comment, section 5).
-        self.verified_pw1_sign = false;
-        self.verified_pw3_admin = false;
-        Ok(Box::new(FakeCardTransaction { card: self }))
+        inner.verified_pw1_sign = false;
+        inner.verified_pw3_admin = false;
+        drop(inner);
+        Ok(Box::new(FakeCardTransaction {
+            inner: Arc::clone(&self.inner),
+        }))
     }
 }
 
 /// The transaction handle [`FakeCard::transaction`] hands out. All actual
 /// response fabrication happens in [`CardTransaction::transmit`] below.
-struct FakeCardTransaction<'a> {
-    card: &'a mut FakeCard,
+/// Holds its own `Arc` clone of the shared [`Inner`] (rather than a
+/// borrowed `&mut FakeCard`) precisely so it has no lifetime tied back to
+/// the `FakeCard` it came from — letting [`FakeCard::transaction`] return
+/// it without borrowing `self` for longer than that one call.
+struct FakeCardTransaction {
+    inner: Arc<Mutex<Inner>>,
 }
 
-impl CardTransaction for FakeCardTransaction<'_> {
+impl CardTransaction for FakeCardTransaction {
     fn transmit(&mut self, cmd: &[u8], _buf_size: usize) -> Result<Vec<u8>, SmartcardError> {
         if cmd.len() < 4 {
             return Err(SmartcardError::Error(format!(
@@ -720,23 +777,26 @@ impl CardTransaction for FakeCardTransaction<'_> {
             )));
         }
         let (ins, p1, p2) = (cmd[1], cmd[2], cmd[3]);
+        let mut card = self.inner.lock().unwrap();
 
         match ins {
             ins::SELECT => Ok(ok(vec![])),
 
             ins::GET_DATA => {
                 if (p1, p2) == TAG_APPLICATION_RELATED_DATA {
-                    if self.card.broken {
+                    if card.broken {
                         // Simulate a card that connects but can't provide
                         // Application Related Data (wrong applet,
                         // corrupted state) — see `FakeCard::broken`.
                         return Ok(vec![0x6A, 0x88]); // StatusBytes::ReferencedDataNotFound
                     }
                     Ok(ok(build_application_related_data(
-                        self.card.manufacturer,
-                        self.card.serial,
-                        self.card.uif_sig,
-                        &self.card.algo_sig,
+                        card.manufacturer,
+                        card.serial,
+                        card.uif_sig,
+                        &card.algo_sig,
+                        card.pw1.retries_left,
+                        card.pw3.retries_left,
                     )))
                 } else {
                     // StatusBytes::ReferencedDataNotFound — a real card's
@@ -758,8 +818,8 @@ impl CardTransaction for FakeCardTransaction<'_> {
                     // `verified_pw1_sign`/`verified_pw3_admin` below (which
                     // gate `PSO`/`GENERATE ASYMMETRIC KEY PAIR` instead).
                     let n = match p2 {
-                        VERIFY_P2_SIGN | VERIFY_P2_USER => self.card.pw1.retries_left,
-                        _ => self.card.pw3.retries_left,
+                        VERIFY_P2_SIGN | VERIFY_P2_USER => card.pw1.retries_left,
+                        _ => card.pw3.retries_left,
                     };
                     return Ok(vec![0x63, 0xC0 | n]);
                 }
@@ -777,8 +837,8 @@ impl CardTransaction for FakeCardTransaction<'_> {
                 let pin = cmd.get(5..5 + lc).unwrap_or(&[]);
 
                 let status = match p2 {
-                    VERIFY_P2_SIGN | VERIFY_P2_USER => self.card.pw1.verify(pin),
-                    _ => self.card.pw3.verify(pin),
+                    VERIFY_P2_SIGN | VERIFY_P2_USER => card.pw1.verify(pin),
+                    _ => card.pw3.verify(pin),
                 };
                 let verified = status == [0x90, 0x00];
 
@@ -788,8 +848,8 @@ impl CardTransaction for FakeCardTransaction<'_> {
                 // behavior: a wrong PIN invalidates any prior successful
                 // verification for that key reference).
                 match p2 {
-                    VERIFY_P2_SIGN => self.card.verified_pw1_sign = verified,
-                    VERIFY_P2_ADMIN => self.card.verified_pw3_admin = verified,
+                    VERIFY_P2_SIGN => card.verified_pw1_sign = verified,
+                    VERIFY_P2_ADMIN => card.verified_pw3_admin = verified,
                     _ => {}
                 }
 
@@ -803,24 +863,24 @@ impl CardTransaction for FakeCardTransaction<'_> {
                 // — later tasks only ever generate that one slot.
                 match p1 {
                     0x80 => {
-                        if !self.card.verified_pw3_admin {
+                        if !card.verified_pw3_admin {
                             // StatusBytes::SecurityStatusNotSatisfied — a
                             // real card requires PW3 (admin) VERIFYed
                             // before key generation (I-1 finding).
                             return Ok(vec![0x69, 0x82]);
                         }
-                        self.card.signing_key_generated = true;
-                        Ok(ok(build_generate_key_response(&self.card.algo_sig)))
+                        card.signing_key_generated = true;
+                        Ok(ok(build_generate_key_response(&card.algo_sig)))
                     }
-                    0x81 if self.card.signing_key_generated => {
-                        Ok(ok(build_generate_key_response(&self.card.algo_sig)))
+                    0x81 if card.signing_key_generated => {
+                        Ok(ok(build_generate_key_response(&card.algo_sig)))
                     }
                     _ => Ok(vec![0x6A, 0x88]), // no key generated yet
                 }
             }
 
             ins::PUT_DATA => {
-                if !self.card.verified_pw3_admin {
+                if !card.verified_pw3_admin {
                     // StatusBytes::SecurityStatusNotSatisfied — a real
                     // card requires PW3 (admin) VERIFYed before any PUT
                     // DATA write (algorithm attributes, touch policy,
@@ -839,7 +899,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
                     if let Some(bytes) = cmd.get(5..)
                         && bytes.len() >= 2
                     {
-                        self.card.uif_sig = [bytes[0], bytes[1]];
+                        card.uif_sig = [bytes[0], bytes[1]];
                     }
                 }
                 if (p1, p2) == (0x00, 0xc1) {
@@ -857,7 +917,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
                     if let Some(&lc) = cmd.get(4) {
                         let lc = lc as usize;
                         if let Some(bytes) = cmd.get(5..5 + lc) {
-                            self.card.algo_sig = bytes.to_vec();
+                            card.algo_sig = bytes.to_vec();
                         }
                     }
                 }
@@ -865,13 +925,13 @@ impl CardTransaction for FakeCardTransaction<'_> {
             }
 
             ins::PSO if (p1, p2) == PSO_COMPUTE_DIGITAL_SIGNATURE => {
-                if !self.card.verified_pw1_sign {
+                if !card.verified_pw1_sign {
                     // StatusBytes::SecurityStatusNotSatisfied — a real
                     // card requires PW1 (signing mode) VERIFYed before
                     // PSO: COMPUTE DIGITAL SIGNATURE (I-1 finding).
                     return Ok(vec![0x69, 0x82]);
                 }
-                if self.card.touch_timeout {
+                if card.touch_timeout {
                     // Real string shape confirmed against
                     // `card-backend-pcsc-0.5.2`'s `PcscTransaction::transmit`
                     // (~line 274): every `pcsc::Error` other than
@@ -883,7 +943,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
                         "Transmit failed: Timeout".to_string(),
                     ));
                 }
-                if self.card.card_removed_mid_signature {
+                if card.card_removed_mid_signature {
                     // Same transport call site and formatting as the touch
                     // timeout above, but `pcsc::Error::RemovedCard`'s own
                     // variant name — a genuinely different transport fault
@@ -899,7 +959,7 @@ impl CardTransaction for FakeCardTransaction<'_> {
                 // Short-form Lc only, same caveat as the VERIFY arm above.
                 let lc = cmd.get(4).copied().unwrap_or(0) as usize;
                 let data = cmd.get(5..5 + lc).unwrap_or(&[]).to_vec();
-                *self.card.last_signed_data.lock().unwrap() = data;
+                card.last_signed_data = data;
                 Ok(ok(FAKE_ED25519_SIGNATURE.to_vec()))
             }
 

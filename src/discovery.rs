@@ -134,6 +134,137 @@ pub fn discover_card_from(
     Err(YubiError::CardNotFound(message.to_string()))
 }
 
+/// Find the specific connected OpenPGP card whose serial/AID matches
+/// `expected_serial`, among *all* enumerated candidates — unlike
+/// [`discover_card_from`], which just returns the first usable one.
+///
+/// Fixes Finding I-2: with several OpenPGP-capable devices attached, the
+/// physical card a `YubiKeySigner` was bound to at construction might not
+/// be the first one `card_backends()` happens to enumerate. The old
+/// first-match behavior meant [`sign::YubiKeySigner::sign`] would open
+/// *whichever* card came first and then fail with [`YubiError::WrongCard`]
+/// if it wasn't the right one, even though the right card was attached
+/// all along. This function instead opens *every* present, OpenPGP-capable
+/// candidate (same per-candidate skip/error handling as
+/// [`discover_card_from`]: a `CardNotFound` on one candidate is skipped,
+/// not fatal) and reads its serial, returning the first whose serial
+/// matches. Reading a non-matching candidate's serial needs no PIN — it's
+/// a plain `Card<Open>::transaction()` + cached-ART read, same cost as
+/// [`read_serial`] anywhere else in this crate.
+///
+/// [`sign::YubiKeySigner::sign`]: crate::sign::YubiKeySigner::sign
+/// [`YubiError::WrongCard`]: crate::YubiError::WrongCard
+pub fn discover_card_by_serial_from(
+    cards: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
+    expected_serial: &str,
+) -> Result<Card<Open>, YubiError> {
+    let mut saw_broken_candidate = false;
+    let mut other_serials = Vec::new();
+    for backend in cards.filter_map(Result::ok) {
+        match Card::<Open>::new(backend) {
+            Ok(mut card) => {
+                let serial = {
+                    let mut tx = card.transaction()?;
+                    read_serial(&mut tx)?
+                };
+                if serial == expected_serial {
+                    return Ok(card);
+                }
+                other_serials.push(serial);
+            }
+            // Same reasoning as `discover_card_from`: a candidate with no
+            // card present isn't evidence of a broken card.
+            Err(OpenpgpError::Smartcard(SmartcardError::CardNotFound(_))) => {}
+            Err(_) => saw_broken_candidate = true,
+        }
+    }
+    let message = if !other_serials.is_empty() {
+        format!(
+            "expected YubiKey (serial {expected_serial}) not found -- found {} other card(s) \
+             instead: {}",
+            other_serials.len(),
+            other_serials.join(", ")
+        )
+    } else if saw_broken_candidate {
+        format!(
+            "expected YubiKey (serial {expected_serial}) not found -- a card was found but \
+             could not be opened as an OpenPGP card (wrong applet, corrupted card state, or \
+             the card was removed mid-detection)"
+        )
+    } else {
+        format!(
+            "expected YubiKey (serial {expected_serial}) not found -- no OpenPGP-capable card \
+             found on any connected PC/SC reader"
+        )
+    };
+    Err(YubiError::CardNotFound(message))
+}
+
+/// [`discover_card_by_serial_from`], wired to the real `card_backends()`
+/// enumeration — the counterpart to [`discover_real_card`] that selects by
+/// serial instead of taking the first usable card. Used by
+/// [`sign::YubiKeySigner::sign`] (Finding I-2).
+///
+/// [`sign::YubiKeySigner::sign`]: crate::sign::YubiKeySigner::sign
+pub fn discover_real_card_by_serial(expected_serial: &str) -> Result<Card<Open>, YubiError> {
+    let cards = PcscBackend::card_backends(None).map_err(map_enumeration_error)?;
+    discover_card_by_serial_from(cards, expected_serial)
+}
+
+/// A summary of one attached, OpenPGP-capable card, for a provisioning
+/// tool to show the operator *before* doing anything destructive (Finding
+/// I-2/I-3): which card(s) are attached, and whether each one's Signature
+/// slot already holds a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardSummary {
+    /// The card's serial/AID, as [`read_serial`] renders it.
+    pub serial: String,
+    /// Whether the Signature slot already holds a key — see
+    /// `provision::signature_slot_has_key`, which this is built from.
+    pub has_signature_key: bool,
+}
+
+/// Enumerate every present, OpenPGP-capable candidate and summarize each
+/// one (serial + Signature-slot occupancy) — the backend-agnostic core of
+/// [`list_cards`], independently testable against
+/// [`crate::testing::FakeCard`].
+///
+/// Unlike [`discover_card_from`]/[`discover_card_by_serial_from`], this is
+/// a best-effort, informational listing, not a hard "I need exactly one
+/// usable card" discovery: a candidate that fails to open as OpenPGP (or
+/// has no card present) is silently skipped rather than reported as an
+/// error, so one bad reader doesn't hide every good one from the operator.
+/// An empty result (`Ok(vec![])`) is a valid, non-error outcome — "nothing
+/// is attached" is useful information for a provisioning tool to show,
+/// not a failure.
+pub fn list_cards_from(
+    cards: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
+) -> Result<Vec<CardSummary>, YubiError> {
+    let mut out = Vec::new();
+    for backend in cards.filter_map(Result::ok) {
+        let Ok(mut card) = Card::<Open>::new(backend) else {
+            continue;
+        };
+        let mut tx = card.transaction()?;
+        let serial = read_serial(&mut tx)?;
+        let has_signature_key = crate::provision::signature_slot_has_key(&mut tx)?;
+        out.push(CardSummary {
+            serial,
+            has_signature_key,
+        });
+    }
+    Ok(out)
+}
+
+/// [`list_cards_from`], wired to the real `card_backends()` enumeration.
+/// For a CLI provisioning flow to show the operator which card(s) are
+/// attached, and whether each already holds a Signature-slot key, before
+/// choosing one to provision (Finding I-2/I-3).
+pub fn list_cards() -> Result<Vec<CardSummary>, YubiError> {
+    let cards = PcscBackend::card_backends(None).map_err(map_enumeration_error)?;
+    list_cards_from(cards)
+}
+
 /// Read a discovered card's serial/AID as a stable, human-readable
 /// string — needed by `aivyx-federation`'s binding record (Task 7) to
 /// detect "wrong card inserted" (see this crate's design spec).
@@ -175,6 +306,8 @@ fn map_enumeration_error(err: SmartcardError) -> YubiError {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::SecretString;
+
     use super::*;
     use crate::testing::FakeCard;
 
@@ -330,5 +463,100 @@ mod tests {
         // `FakeCard::new()`'s fixed manufacturer (0x0006, "Yubico AB")
         // and serial (0x00112233) — see `testing.rs`.
         assert_eq!(serial, "0006:00112233");
+    }
+
+    // --- Finding I-2: find a specific card by serial among several ---
+
+    #[test]
+    fn finds_the_matching_card_when_it_enumerates_first() {
+        let wanted = FakeCard::new(); // default serial "0006:00112233"
+        let other = FakeCard::new().with_serial(0x0099_9999);
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(wanted.into()), Ok(other.into())];
+
+        let mut card = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .expect("the wanted card should be found");
+        let mut tx = card.transaction().expect("transaction should start");
+        assert_eq!(read_serial(&mut tx).unwrap(), "0006:00112233");
+    }
+
+    #[test]
+    fn finds_the_matching_card_when_it_enumerates_second() {
+        // Finding I-2's actual bug: the old `discover_card_from` returned
+        // whichever card enumerated first, so `sign()` failed with
+        // `WrongCard` whenever the right card wasn't first. This must now
+        // find the right card regardless of enumeration order.
+        let other = FakeCard::new().with_serial(0x0099_9999);
+        let wanted = FakeCard::new(); // default serial "0006:00112233"
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(other.into()), Ok(wanted.into())];
+
+        let mut card = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .expect("the wanted card should be found even when it enumerates second");
+        let mut tx = card.transaction().expect("transaction should start");
+        assert_eq!(read_serial(&mut tx).unwrap(), "0006:00112233");
+    }
+
+    #[test]
+    fn reports_card_not_found_when_the_wanted_serial_is_absent() {
+        let other = FakeCard::new().with_serial(0x0099_9999);
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(other.into())];
+
+        let err = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .err()
+            .expect("the wanted card is not among the candidates");
+        assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    #[test]
+    fn empty_backends_reports_card_not_found_when_searching_by_serial() {
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> = vec![];
+
+        let err = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .err()
+            .expect("no candidates at all should fail");
+        assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    // --- `list_cards_from`: enumerate all attached cards for a provisioning tool ---
+
+    #[test]
+    fn list_cards_from_reports_serial_and_key_occupancy_for_each_card() {
+        let unprovisioned = FakeCard::new().with_serial(0x0000_0001);
+        let provisioned = {
+            let fake = FakeCard::new().with_serial(0x0000_0002);
+            let mut card = Card::new(fake.clone()).unwrap();
+            {
+                let mut tx = card.transaction().unwrap();
+                let admin_pin = SecretString::from(
+                    std::str::from_utf8(crate::testing::FACTORY_DEFAULT_ADMIN_PIN).unwrap(),
+                );
+                let mut admin = tx.as_admin_card(admin_pin).unwrap();
+                crate::provision::generate_signature_key(&mut admin)
+                    .expect("key generation should succeed against the fake");
+            }
+            fake
+        };
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(unprovisioned.into()), Ok(provisioned.into())];
+
+        let mut cards =
+            list_cards_from(backends.into_iter()).expect("listing should succeed against fakes");
+        cards.sort_by(|a, b| a.serial.cmp(&b.serial));
+
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].serial, "0006:00000001");
+        assert!(!cards[0].has_signature_key);
+        assert_eq!(cards[1].serial, "0006:00000002");
+        assert!(cards[1].has_signature_key);
+    }
+
+    #[test]
+    fn list_cards_from_returns_an_empty_list_when_nothing_is_attached() {
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> = vec![];
+
+        let cards = list_cards_from(backends.into_iter()).expect("an empty list is not an error");
+        assert!(cards.is_empty());
     }
 }

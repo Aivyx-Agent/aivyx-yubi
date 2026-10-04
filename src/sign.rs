@@ -227,7 +227,9 @@ use openpgp_card::{
     },
     state::Open,
 };
-use secrecy::SecretString;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::{YubiError, discovery, pin::PinKind};
 
@@ -236,16 +238,54 @@ use crate::{YubiError, discovery, pin::PinKind};
 /// grounding and, in particular, why this type is safe to hold across a
 /// long-lived process despite never keeping a card session open.
 ///
+/// # PIN-retry safety (2026-10-04 audit, Finding I-1)
+///
+/// This signer presents `user_pin` to the card fresh on every [`Self::sign`]
+/// call (see this module's own doc comment, "is a PIN needed before every
+/// signature"). That is correct for a *right* PIN, but dangerous for a
+/// *wrong* one: a caller that retries `sign()` (a federation request
+/// retry, a daemon loop, ...) with an already-known-bad PIN would, before
+/// this fix, re-present that same wrong PIN every time, spending one of
+/// the User PIN's few real retries per call -- three retried calls is
+/// enough to permanently block signing (the User PIN is recoverable via
+/// the Admin PIN, but that's still a hard operational failure this crate
+/// can prevent for free). `YubiKeySigner` now does two things about it:
+///
+/// 1. [`Self::new`] rejects an empty PIN outright
+///    ([`YubiError::EmptyPin`]) -- found live in `aivyx-pa`'s
+///    `yubikey-init`, which was constructing a signer with
+///    `SecretString::from(String::new())`; an empty PIN is certain to be
+///    rejected by the card on first use, so failing at construction
+///    catches the mistake immediately rather than on first `sign()`.
+/// 2. After the card rejects `user_pin` once (`YubiError::PinIncorrect` or
+///    a User-PIN [`YubiError::PinBlocked`]), `pin_rejected` latches and
+///    every later [`Self::sign`] call fails immediately with that same
+///    error *without contacting the card at all* -- so a caller that
+///    retries never spends a second real PIN attempt on a PIN already
+///    known to be wrong. The latch is per-`YubiKeySigner` instance, not
+///    persisted: constructing a new signer (presumably with a corrected
+///    PIN) starts fresh.
+///
+/// [`YubiError::EmptyPin`]: crate::YubiError::EmptyPin
+/// [`YubiError::PinBlocked`]: crate::YubiError::PinBlocked
+///
 /// Deliberately does not derive/implement `Debug` on its own fields'
 /// behalf beyond what `secrecy::SecretString` itself safely provides
 /// (`SecretBox<str>([REDACTED])`, never the real PIN) — the derive is
 /// otherwise plain field-by-field, not a hand-written impl, since none of
-/// `card_serial`/`public_key` are sensitive.
+/// `card_serial`/`public_key`/`pin_rejected` are sensitive.
 #[derive(Debug)]
 pub struct YubiKeySigner {
     card_serial: String,
     public_key: [u8; 32],
     user_pin: SecretString,
+    /// Latches `true` the first time the card rejects `user_pin` (wrong or
+    /// blocked). See this struct's own doc comment, "PIN-retry safety".
+    /// `AtomicBool` rather than a plain `bool` because [`Self::sign`] takes
+    /// `&self`, not `&mut self` (see that method's own doc comment for why
+    /// that's load-bearing) -- this is the one piece of state `sign()`
+    /// still needs to mutate despite that.
+    pin_rejected: AtomicBool,
 }
 
 impl YubiKeySigner {
@@ -274,7 +314,14 @@ impl YubiKeySigner {
     /// [`crate::testing::FakeCard`] in this module's own tests), reads the
     /// card's serial and the Signature slot's current public key and
     /// builds a [`YubiKeySigner`] bound to them.
+    ///
+    /// Rejects an empty `user_pin` with [`YubiError::EmptyPin`] before
+    /// doing anything else, including opening a transaction -- see this
+    /// struct's own doc comment, "PIN-retry safety".
     fn from_open_card(mut card: Card<Open>, user_pin: SecretString) -> Result<Self, YubiError> {
+        if user_pin.expose_secret().is_empty() {
+            return Err(YubiError::EmptyPin);
+        }
         let mut tx = card.transaction()?;
         let card_serial = discovery::read_serial(&mut tx)?;
         let public_key = read_signature_public_key(&mut tx)?;
@@ -282,6 +329,7 @@ impl YubiKeySigner {
             card_serial,
             public_key,
             user_pin,
+            pin_rejected: AtomicBool::new(false),
         })
     }
 
@@ -338,20 +386,96 @@ impl YubiKeySigner {
     /// would serialize all federation signing. `&self` keeps that door
     /// open for free while nothing in this workspace yet calls `sign()`
     /// in production.
+    ///
+    /// # Finds this signer's own card among several attached (2026-10-04
+    /// # audit, Finding I-2)
+    ///
+    /// Discovers the card by `self.card_serial`
+    /// ([`discovery::discover_real_card_by_serial`]), not just the first
+    /// one enumerated: with more than one OpenPGP-capable device attached,
+    /// the first-enumerated one is not necessarily this signer's own, and
+    /// enumeration order is outside this crate's control (reader order,
+    /// OS-level enumeration, ...). Previously this called
+    /// [`discovery::discover_real_card`] (first-match) and relied on
+    /// `sign_with_open_card`'s own serial check to fail closed with
+    /// [`YubiError::WrongCard`] when that guess was wrong -- correct but
+    /// unhelpfully brittle, since the right card could be sitting in a
+    /// different reader the whole time.
+    ///
+    /// # Stops after the first PIN rejection (2026-10-04 audit, Finding I-1)
+    ///
+    /// See this struct's own doc comment, "PIN-retry safety".
     pub fn sign(&self, message: &[u8]) -> Result<[u8; 64], YubiError> {
-        let card = discovery::discover_real_card()?;
-        Self::sign_with_open_card(card, &self.card_serial, &self.user_pin, message)
+        self.sign_checking_latch(
+            || discovery::discover_real_card_by_serial(&self.card_serial),
+            message,
+        )
+    }
+
+    /// Shared `&self` core behind both [`Self::sign`] and this module's
+    /// own `#[cfg(test)]` seam ([`Self::sign_from`]): checks (and updates)
+    /// the PIN-rejection latch (2026-10-04 audit, Finding I-1), discovers a card via
+    /// `discover` (real hardware for [`Self::sign`], an injected fake-card
+    /// backend iterator for tests), and delegates to
+    /// [`Self::sign_with_open_card`].
+    fn sign_checking_latch(
+        &self,
+        discover: impl FnOnce() -> Result<Card<Open>, YubiError>,
+        message: &[u8],
+    ) -> Result<[u8; 64], YubiError> {
+        if self.pin_rejected.load(Ordering::SeqCst) {
+            // Already know `user_pin` is wrong (or blocked) for this
+            // card -- fail immediately, without even discovering the
+            // card, let alone presenting the PIN to it again.
+            return Err(YubiError::PinIncorrect);
+        }
+        let card = discover()?;
+        let result = Self::sign_with_open_card(
+            card,
+            &self.card_serial,
+            &self.public_key,
+            &self.user_pin,
+            message,
+        );
+        if let Err(ref err) = result
+            && is_pin_rejection(err)
+        {
+            self.pin_rejected.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// [`Self::sign`], but discovers the card from an arbitrary backend
+    /// iterator — the seam this module's own tests use to exercise the
+    /// PIN-rejection latch (2026-10-04 audit, Finding I-1) across *multiple, independent*
+    /// `sign()` calls against what's meant to be one physical card (each
+    /// clone of one [`crate::testing::FakeCard`] shares its underlying
+    /// state — see that type's own doc comment).
+    #[cfg(test)]
+    fn sign_from(
+        &self,
+        backends: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
+        message: &[u8],
+    ) -> Result<[u8; 64], YubiError> {
+        let expected_serial = self.card_serial.clone();
+        self.sign_checking_latch(
+            move || discovery::discover_card_by_serial_from(backends, &expected_serial),
+            message,
+        )
     }
 
     /// The testable core of [`Self::sign`]: given an already-opened
-    /// `Card<Open>`, checks its serial matches `expected_serial`, verifies
-    /// the User PIN for signing, and performs the actual `PSO: COMPUTE
-    /// DIGITAL SIGNATURE`, mapping every real failure path to the matching
+    /// `Card<Open>`, checks its serial matches `expected_serial` and its
+    /// current Signature-slot public key still matches
+    /// `expected_public_key` (2026-10-04 audit, Finding M-1), verifies the
+    /// User PIN for signing, and performs the actual `PSO: COMPUTE DIGITAL
+    /// SIGNATURE`, mapping every real failure path to the matching
     /// [`YubiError`] variant. See this module's doc comment for the
     /// grounding behind each mapping.
     fn sign_with_open_card(
         mut card: Card<Open>,
         expected_serial: &str,
+        expected_public_key: &[u8; 32],
         user_pin: &SecretString,
         message: &[u8],
     ) -> Result<[u8; 64], YubiError> {
@@ -367,6 +491,23 @@ impl YubiKeySigner {
                 expected: expected_serial.to_string(),
                 found: found_serial,
             });
+        }
+
+        // Checked before presenting the PIN or attempting to sign
+        // (2026-10-04 audit, Finding M-1): the Signature slot may have
+        // been re-keyed since this signer cached `public_key()` at
+        // construction (deliberately, or by other tooling sharing the
+        // card) -- continuing to sign in that case would produce
+        // signatures from a *different* private key than the one
+        // `public_key()` still reports, which a peer verifying against
+        // the stale cached key would reject with no diagnosable cause.
+        // Reading it back costs one more `GET DATA`/`GENERATE ASYMMETRIC
+        // KEY PAIR`(read) call, needs no PIN (same as the serial check
+        // above), and is cheap insurance against a silently wrong
+        // identity binding.
+        let current_public_key = read_signature_public_key(&mut tx)?;
+        if current_public_key != *expected_public_key {
+            return Err(YubiError::SignatureKeyChanged);
         }
 
         // Checked before presenting the PIN or attempting to sign: this
@@ -400,12 +541,27 @@ impl YubiKeySigner {
     fn discover_and_sign(
         backends: impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>>,
         expected_serial: &str,
+        expected_public_key: &[u8; 32],
         user_pin: &SecretString,
         message: &[u8],
     ) -> Result<[u8; 64], YubiError> {
         let card = discovery::discover_card_from(backends)?;
-        Self::sign_with_open_card(card, expected_serial, user_pin, message)
+        Self::sign_with_open_card(card, expected_serial, expected_public_key, user_pin, message)
     }
+}
+
+/// True if `err` means the card rejected `user_pin` itself (wrong, or
+/// blocked) — as opposed to any other signing failure (touch timeout,
+/// card absent, wrong card, re-keyed slot, ...) that doesn't mean the PIN
+/// is bad and so must not latch [`YubiKeySigner::sign`] shut (Finding
+/// I-1). Only the User-PIN-labeled [`YubiError::PinBlocked`] counts here
+/// — `sign_with_open_card` only ever presents PW1 (User), via
+/// `map_signing_pin_error`, which always labels a blocked PW1 as `"User"`
+/// (never the generic fallback's `"Some"`, see `lib.rs`) — so matching on
+/// that label is correct, not just defensive.
+fn is_pin_rejection(err: &YubiError) -> bool {
+    matches!(err, YubiError::PinIncorrect)
+        || matches!(err, YubiError::PinBlocked { pin_kind: "User", .. })
 }
 
 /// Confirm the Signature slot's *live* touch policy is `Fixed` (physical
@@ -619,9 +775,14 @@ mod tests {
         let card = provisioned_card();
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let signature =
-            YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"hello, aivyx")
-                .expect("signing should succeed against the fake");
+        let signature = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &user_pin,
+            b"hello, aivyx",
+        )
+        .expect("signing should succeed against the fake");
 
         assert_eq!(signature, FakeCard::fake_signature());
         assert_eq!(signature.len(), 64);
@@ -638,8 +799,14 @@ mod tests {
         let card = provisioned_card_with_touch_off(FakeCard::new());
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
-            .expect_err("signing against a touch-disabled Signature slot must be refused");
+        let err = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &user_pin,
+            b"message",
+        )
+        .expect_err("signing against a touch-disabled Signature slot must be refused");
 
         assert!(
             matches!(err, YubiError::TouchPolicyNotEnforced),
@@ -652,20 +819,27 @@ mod tests {
         // Finding I-2: the single most load-bearing correctness claim in
         // this module (no host-side hashing, the raw message is sent as
         // the PSO:CDS data field unchanged) had zero regression
-        // protection. Record the fake's handle *before* moving it into
+        // protection. Clone the fake *before* moving the original into
         // `Card::new` (which boxes it with no handle retained -- see
-        // `testing.rs`'s doc comment, section 5).
+        // `testing.rs`'s doc comment) so the clone (sharing the same
+        // underlying state) can still be inspected afterward.
         let fake = FakeCard::new();
-        let last_signed_data = fake.last_signed_data_handle();
+        let fake_handle = fake.clone();
         let card = provisioned_card_from(fake);
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
         let message = b"hello, aivyx";
 
-        YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, message)
-            .expect("signing should succeed against the fake");
+        YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &user_pin,
+            message,
+        )
+        .expect("signing should succeed against the fake");
 
         assert_eq!(
-            last_signed_data.lock().unwrap().as_slice(),
+            fake_handle.last_signed_data(),
             message,
             "the card should receive the raw message bytes unchanged, not a hash/digest"
         );
@@ -707,6 +881,7 @@ mod tests {
         let err = YubiKeySigner::discover_and_sign(
             backends.into_iter(),
             DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
             &user_pin,
             b"message",
         )
@@ -729,6 +904,7 @@ mod tests {
         let err = YubiKeySigner::discover_and_sign(
             backends.into_iter(),
             DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
             &user_pin,
             b"message",
         )
@@ -748,8 +924,14 @@ mod tests {
         let card = provisioned_card_from(FakeCard::new().with_changed_user_pin(b"000000"));
         let wrong_pin = SecretString::from("999999");
 
-        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &wrong_pin, b"message")
-            .expect_err("signing with the wrong PIN should fail");
+        let err = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &wrong_pin,
+            b"message",
+        )
+        .expect_err("signing with the wrong PIN should fail");
 
         assert!(matches!(err, YubiError::PinIncorrect));
     }
@@ -759,8 +941,14 @@ mod tests {
         let card = provisioned_card_from(FakeCard::new().with_touch_timeout());
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
-            .expect_err("a simulated touch timeout should fail signing");
+        let err = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &user_pin,
+            b"message",
+        )
+        .expect_err("a simulated touch timeout should fail signing");
 
         assert!(matches!(err, YubiError::TouchTimeout));
     }
@@ -774,14 +962,144 @@ mod tests {
         let card = provisioned_card_from(FakeCard::new().with_card_removed_mid_signature());
         let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
 
-        let err = YubiKeySigner::sign_with_open_card(card, DEFAULT_SERIAL, &user_pin, b"message")
-            .expect_err("a simulated card removal should fail signing");
+        let err = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &FakeCard::fake_public_key(),
+            &user_pin,
+            b"message",
+        )
+        .expect_err("a simulated card removal should fail signing");
 
         assert!(
             !matches!(err, YubiError::TouchTimeout),
             "a removed card must not be misreported as a touch timeout, got {err:?}"
         );
         assert!(matches!(err, YubiError::CardNotFound(_)));
+    }
+
+    /// A fresh [`FakeCard`], fully provisioned (admin-generated Ed25519
+    /// Signature-slot key, touch policy `Fixed`) — same setup as
+    /// [`provisioned_card_from`], but returns the still-usable [`FakeCard`]
+    /// handle itself (which the test can go on to clone into backend
+    /// iterators and/or inspect retry counts on) rather than consuming it
+    /// into a `Card<Open>`.
+    fn provisioned_fake() -> FakeCard {
+        let fake = FakeCard::new();
+        {
+            let mut card = Card::new(fake.clone()).expect("Card::new should succeed");
+            let mut tx = card.transaction().expect("transaction should start");
+            let admin_pin = SecretString::from(pin::FACTORY_DEFAULT_ADMIN_PIN);
+            let mut admin = tx
+                .as_admin_card(admin_pin)
+                .expect("admin PIN should verify against the fake's factory-default PW3");
+            provision::generate_signature_key(&mut admin)
+                .expect("key generation should succeed against the fake");
+            provision::set_signature_touch_policy_fixed(&mut admin)
+                .expect("touch policy should be settable against the fake");
+        }
+        fake
+    }
+
+    /// One fresh one-item backend iterator wrapping a clone of `fake` —
+    /// `sign_from`/`discover_and_construct` each consume their iterator,
+    /// so a fresh one is needed per call even when it's meant to represent
+    /// "the same physical card" (which `FakeCard::clone()`, sharing state,
+    /// achieves).
+    fn backends_for(
+        fake: &FakeCard,
+    ) -> impl Iterator<Item = Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> {
+        std::iter::once(Ok(fake.clone().into()))
+    }
+
+    #[test]
+    fn construction_rejects_an_empty_pin() {
+        // 2026-10-04 audit, Finding I-1: found live in aivyx-pa's
+        // `yubikey-init`, constructing `YubiKeySigner::new(SecretString::
+        // from(String::new()))`. An empty PIN is certain to be rejected by
+        // the card on first use; refuse it here instead.
+        let fake = provisioned_fake();
+
+        let err = YubiKeySigner::discover_and_construct(backends_for(&fake), SecretString::from(""))
+            .expect_err("an empty PIN must be rejected at construction");
+
+        assert!(matches!(err, YubiError::EmptyPin));
+    }
+
+    #[test]
+    fn three_sign_calls_with_a_wrong_pin_spend_exactly_one_real_pin_attempt() {
+        // 2026-10-04 audit, Finding I-1, the core guarantee: a caller that retries `sign()`
+        // with an already-known-bad PIN (a federation request retry, a
+        // daemon loop, ...) must not be able to walk the User PIN toward
+        // blocked. The first call spends one real retry (the card
+        // genuinely doesn't know the PIN is bad yet); the latch that sets
+        // afterward must make every later call fail immediately, without
+        // even discovering the card again, let alone presenting the PIN.
+        let fake = provisioned_fake();
+        let wrong_pin = SecretString::from("999999");
+        let signer = YubiKeySigner::discover_and_construct(backends_for(&fake), wrong_pin)
+            .expect("construction never verifies the PIN against the card, so this succeeds");
+        assert_eq!(fake.user_pin_retries_left(), 3, "construction must spend no retry at all");
+
+        for attempt in 1..=3 {
+            let err = signer
+                .sign_from(backends_for(&fake), b"message")
+                .expect_err("signing with a wrong PIN should fail");
+            assert!(
+                matches!(err, YubiError::PinIncorrect),
+                "attempt {attempt}: expected PinIncorrect, got {err:?}"
+            );
+            assert_eq!(
+                fake.user_pin_retries_left(),
+                2,
+                "attempt {attempt}: exactly one real PIN attempt should ever be spent, no more"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_finds_the_right_card_even_when_another_card_enumerates_first() {
+        // 2026-10-04 audit, Finding I-2: with a second OpenPGP card
+        // attached and enumerating first, `sign()` used to fail with
+        // `WrongCard` even though the right card was present. It must now
+        // find the right one regardless of enumeration order.
+        let fake = provisioned_fake();
+        let other = FakeCard::new().with_serial(0x0099_9999);
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+        let signer = YubiKeySigner::discover_and_construct(backends_for(&fake), user_pin)
+            .expect("construction should succeed against the fake");
+
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(other.into()), Ok(fake.clone().into())];
+
+        let signature = signer
+            .sign_from(backends.into_iter(), b"message")
+            .expect("the right card should be found despite enumeration order");
+
+        assert_eq!(signature, FakeCard::fake_signature());
+    }
+
+    #[test]
+    fn sign_fails_clearly_when_the_signature_slots_key_has_changed_since_construction() {
+        // 2026-10-04 audit, Finding M-1: the Signature slot was re-keyed
+        // (by other tooling, or a second provisioning run) after this
+        // signer cached `public_key()` at construction. Continuing to sign
+        // would silently produce signatures from a different key than
+        // `public_key()` reports.
+        let card = provisioned_card();
+        let user_pin = SecretString::from(pin::FACTORY_DEFAULT_USER_PIN);
+        let stale_cached_key = [0xEE; 32]; // deliberately not FakeCard::fake_public_key()
+
+        let err = YubiKeySigner::sign_with_open_card(
+            card,
+            DEFAULT_SERIAL,
+            &stale_cached_key,
+            &user_pin,
+            b"message",
+        )
+        .expect_err("signing with a stale cached public key must be refused");
+
+        assert!(matches!(err, YubiError::SignatureKeyChanged));
     }
 
     #[test]
