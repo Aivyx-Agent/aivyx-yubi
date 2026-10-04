@@ -532,6 +532,16 @@ struct Inner {
     /// path (`sign.rs`) sends the raw message unmodified, not a hash or
     /// digest — see this module's doc comment, "Finding I-2".
     last_signed_data: Vec<u8>,
+    /// How many times `CardBackend::transaction` has been called on this
+    /// fake. `openpgp_card::Card::<Open>::new` itself makes exactly one
+    /// such call internally (to `SELECT` and read Application Related
+    /// Data) before a caller can make any of its own -- so `1` means
+    /// "construction's own call", and `2+` means a caller's later,
+    /// separate `.transaction()` call. See
+    /// [`FakeCard::broken_after_opening`].
+    transaction_count: u32,
+    /// See [`FakeCard::broken_after_opening`].
+    fail_transactions_after_first: bool,
 }
 
 /// A fake OpenPGP card, standing in for real YubiKey hardware. Implements
@@ -580,6 +590,8 @@ impl FakeCard {
                 verified_pw1_sign: false,
                 verified_pw3_admin: false,
                 last_signed_data: Vec::new(),
+                transaction_count: 0,
+                fail_transactions_after_first: false,
             })),
         }
     }
@@ -591,6 +603,22 @@ impl FakeCard {
     pub fn absent() -> Self {
         let card = Self::new();
         card.inner.lock().unwrap().present = false;
+        card
+    }
+
+    /// Simulate a card that opens fine -- `openpgp_card::Card::<Open>::new`
+    /// succeeds, since that only needs the *first*
+    /// `CardBackend::transaction` call to succeed -- but becomes
+    /// unreachable on any *later*, separate `.transaction()` call (a
+    /// reader glitch, or the card being pulled between a discovery loop
+    /// opening it and that same loop's own follow-up read of its serial or
+    /// Signature-slot occupancy). Added for the 2026-10-04 review of
+    /// `discover_card_by_serial_from`/`list_cards_from`'s skip-and-continue
+    /// behavior: a transient fault on *this* candidate must not abort the
+    /// whole search when a healthy candidate is also present.
+    pub fn broken_after_opening() -> Self {
+        let card = Self::new();
+        card.inner.lock().unwrap().fail_transactions_after_first = true;
         card
     }
 
@@ -745,6 +773,16 @@ impl CardBackend for FakeCard {
         if !inner.present {
             return Err(SmartcardError::CardNotFound(
                 "fake card is absent".to_string(),
+            ));
+        }
+        inner.transaction_count += 1;
+        if inner.fail_transactions_after_first && inner.transaction_count > 1 {
+            // See `FakeCard::broken_after_opening`: the first call (made
+            // internally by `Card::<Open>::new`) succeeds, every later one
+            // fails -- simulating a card that became unreachable right
+            // after a caller opened it.
+            return Err(SmartcardError::Error(
+                "fake card became unreachable after opening".to_string(),
             ));
         }
         // A fresh transaction is this fake's session boundary: PIN

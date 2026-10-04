@@ -284,7 +284,11 @@ pub struct YubiKeySigner {
     /// `AtomicBool` rather than a plain `bool` because [`Self::sign`] takes
     /// `&self`, not `&mut self` (see that method's own doc comment for why
     /// that's load-bearing) -- this is the one piece of state `sign()`
-    /// still needs to mutate despite that.
+    /// still needs to mutate despite that. Accessed with `Ordering::
+    /// Relaxed` (2026-10-04 review): nothing else -- no other field, no
+    /// card I/O -- needs to happen-before or after this flag in another
+    /// thread's view, so there's no ordering relationship here for a
+    /// stricter ordering to actually provide.
     pin_rejected: AtomicBool,
 }
 
@@ -423,7 +427,7 @@ impl YubiKeySigner {
         discover: impl FnOnce() -> Result<Card<Open>, YubiError>,
         message: &[u8],
     ) -> Result<[u8; 64], YubiError> {
-        if self.pin_rejected.load(Ordering::SeqCst) {
+        if self.pin_rejected.load(Ordering::Relaxed) {
             // Already know `user_pin` is wrong (or blocked) for this
             // card -- fail immediately, without even discovering the
             // card, let alone presenting the PIN to it again.
@@ -440,7 +444,7 @@ impl YubiKeySigner {
         if let Err(ref err) = result
             && is_pin_rejection(err)
         {
-            self.pin_rejected.store(true, Ordering::SeqCst);
+            self.pin_rejected.store(true, Ordering::Relaxed);
         }
         result
     }

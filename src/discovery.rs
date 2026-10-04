@@ -163,10 +163,29 @@ pub fn discover_card_by_serial_from(
     for backend in cards.filter_map(Result::ok) {
         match Card::<Open>::new(backend) {
             Ok(mut card) => {
-                let serial = {
-                    let mut tx = card.transaction()?;
-                    read_serial(&mut tx)?
+                // 2026-10-04 review: `Card::<Open>::new` succeeding doesn't
+                // guarantee the follow-up `.transaction()` + `read_serial`
+                // below also will -- a reader glitch or the card being
+                // pulled between enumeration and this read is a real,
+                // transient fault on *this one* candidate, not grounds to
+                // abort the whole search with `?` (which would make an
+                // unrelated card's hiccup hide the operator's own, healthy
+                // card). Skip it exactly like a `Card::new` failure above.
+                let mut tx = match card.transaction() {
+                    Ok(tx) => tx,
+                    Err(_) => {
+                        saw_broken_candidate = true;
+                        continue;
+                    }
                 };
+                let serial = match read_serial(&mut tx) {
+                    Ok(serial) => serial,
+                    Err(_) => {
+                        saw_broken_candidate = true;
+                        continue;
+                    }
+                };
+                drop(tx);
                 if serial == expected_serial {
                     return Ok(card);
                 }
@@ -245,9 +264,22 @@ pub fn list_cards_from(
         let Ok(mut card) = Card::<Open>::new(backend) else {
             continue;
         };
-        let mut tx = card.transaction()?;
-        let serial = read_serial(&mut tx)?;
-        let has_signature_key = crate::provision::signature_slot_has_key(&mut tx)?;
+        // 2026-10-04 review: same reasoning as
+        // `discover_card_by_serial_from` -- `Card::<Open>::new` succeeding
+        // doesn't guarantee the follow-up reads below also will. This is a
+        // best-effort listing (see this function's own doc comment), so a
+        // candidate that fails here is skipped exactly like one that
+        // failed to open at all above, not allowed to fail the whole
+        // listing via `?`.
+        let Ok(mut tx) = card.transaction() else {
+            continue;
+        };
+        let Ok(serial) = read_serial(&mut tx) else {
+            continue;
+        };
+        let Ok(has_signature_key) = crate::provision::signature_slot_has_key(&mut tx) else {
+            continue;
+        };
         out.push(CardSummary {
             serial,
             has_signature_key,
@@ -558,5 +590,91 @@ mod tests {
 
         let cards = list_cards_from(backends.into_iter()).expect("an empty list is not an error");
         assert!(cards.is_empty());
+    }
+
+    // --- 2026-10-04 review: a transient fault on one candidate must not
+    // --- abort the whole search when a healthy one is also present ---
+
+    #[test]
+    fn discover_by_serial_skips_a_candidate_that_fails_after_opening_broken_first() {
+        // `FakeCard::broken_after_opening()` opens fine (`Card::<Open>::new`
+        // succeeds) but fails the follow-up `.transaction()` call this
+        // function makes to read the candidate's serial. That must be
+        // skipped like any other broken candidate, not abort the search
+        // via `?` -- the wanted card, enumerating second, must still be
+        // found.
+        let broken = FakeCard::broken_after_opening();
+        let wanted = FakeCard::new(); // default serial "0006:00112233"
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(broken.into()), Ok(wanted.into())];
+
+        let mut card = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .expect("the wanted card should still be found despite the broken candidate");
+        let mut tx = card.transaction().expect("transaction should start");
+        assert_eq!(read_serial(&mut tx).unwrap(), "0006:00112233");
+    }
+
+    #[test]
+    fn discover_by_serial_skips_a_candidate_that_fails_after_opening_broken_second() {
+        let wanted = FakeCard::new();
+        let broken = FakeCard::broken_after_opening();
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(wanted.into()), Ok(broken.into())];
+
+        let mut card = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .expect("the wanted card should still be found despite the broken candidate");
+        let mut tx = card.transaction().expect("transaction should start");
+        assert_eq!(read_serial(&mut tx).unwrap(), "0006:00112233");
+    }
+
+    #[test]
+    fn discover_by_serial_reports_broken_only_when_nothing_else_is_found() {
+        // No healthy/matching candidate at all -- the broken one is the
+        // only evidence, so the error should say so (not the generic
+        // "no card at all" wording).
+        let broken = FakeCard::broken_after_opening();
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(broken.into())];
+
+        let err = discover_card_by_serial_from(backends.into_iter(), "0006:00112233")
+            .err()
+            .expect("no matching or healthy card is present");
+        match err {
+            YubiError::CardNotFound(msg) => {
+                assert!(
+                    msg.contains("could not be opened"),
+                    "message should mention the broken candidate: {msg}"
+                );
+            }
+            other => panic!("expected YubiError::CardNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_cards_from_skips_a_candidate_that_fails_after_opening_broken_first() {
+        let broken = FakeCard::broken_after_opening();
+        let healthy = FakeCard::new().with_serial(0x0000_0042);
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(broken.into()), Ok(healthy.into())];
+
+        let cards = list_cards_from(backends.into_iter())
+            .expect("a broken candidate must not fail the whole listing");
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].serial, "0006:00000042");
+    }
+
+    #[test]
+    fn list_cards_from_skips_a_candidate_that_fails_after_opening_broken_second() {
+        let healthy = FakeCard::new().with_serial(0x0000_0042);
+        let broken = FakeCard::broken_after_opening();
+        let backends: Vec<Result<Box<dyn CardBackend + Send + Sync>, SmartcardError>> =
+            vec![Ok(healthy.into()), Ok(broken.into())];
+
+        let cards = list_cards_from(backends.into_iter())
+            .expect("a broken candidate must not fail the whole listing");
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].serial, "0006:00000042");
     }
 }
