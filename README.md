@@ -3,6 +3,8 @@
 [![CI](https://github.com/Aivyx-Agent/aivyx-yubi/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Aivyx-Agent/aivyx-yubi/actions/workflows/ci.yml)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
+Part of the [Aivyx Ecosystem](https://aivyx-ecosystem.com/building-blocks/): a shared building block of [Aivyx PA](https://aivyx-ecosystem.com/pa/) and [aivyx-coder](https://aivyx-ecosystem.com/coder/).
+
 Hardware-backed Ed25519 signing via a YubiKey's OpenPGP card applet —
 built so `aivyx-federation`'s cross-boundary identity key can live in a
 hardware device instead of (even encrypted) on disk, with every
