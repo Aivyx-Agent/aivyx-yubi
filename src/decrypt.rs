@@ -14,9 +14,9 @@ use openpgp_card::{
     state::{Admin, Transaction},
 };
 use secrecy::{ExposeSecret, SecretString};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::{YubiError, provision::PublicKeyBytes};
+use crate::{YubiError, pin::PinKind, provision::PublicKeyBytes};
 
 /// A 32-byte X25519 shared secret, zeroed on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -122,24 +122,29 @@ pub fn ecdh(
     }
     tx.verify_user_pin(pin).map_err(|e| match e {
         openpgp_card::Error::CardStatus(StatusBytes::AuthenticationMethodBlocked) => {
-            YubiError::PinBlocked {
-                pin_kind: "User",
-                recovery_hint: "Unblock it with the Admin PIN (RESET RETRY COUNTER).",
-            }
+            PinKind::User.blocked_error()
         }
         other => other.into(),
     })?;
-    let out = tx
-        .card()
-        .decipher(Cryptogram::ECDH(their_public))
-        .map_err(crate::sign::map_sign_error)?;
-    let bytes: [u8; 32] = out.as_slice().try_into().map_err(|_| {
-        YubiError::Other(format!(
+    // The raw ECDH output is the secret itself: keep it in a zeroizing
+    // buffer so it is wiped on every path, including the length-error one.
+    let out = Zeroizing::new(
+        tx.card()
+            .decipher(Cryptogram::ECDH(their_public))
+            .map_err(crate::sign::map_sign_error)?,
+    );
+    if out.len() != 32 {
+        return Err(YubiError::Other(format!(
             "the card returned {} bytes for ECDH, expected 32",
             out.len()
-        ))
-    })?;
-    Ok(SharedSecret(bytes))
+        )));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&out);
+    let shared = SharedSecret(bytes);
+    // `SharedSecret(bytes)` copied the array; wipe the local copy too.
+    bytes.zeroize();
+    Ok(shared)
 }
 
 #[cfg(test)]
