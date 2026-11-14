@@ -293,6 +293,13 @@ const FAKE_RSA_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
 /// the Decryption/Authentication slots (`C2`/`C3`) this crate never
 /// touches.
 const ALGO_ATTRS_RSA2048: [u8; 6] = [0x01, 0x08, 0x00, 0x00, 0x11, 0x00];
+/// PSO P1/P2 for "DECIPHER" (`ocard/commands.rs::decryption`).
+const PSO_DECIPHER: (u8, u8) = (0x80, 0x86);
+/// Algorithm id for ECDH (`ocard/data/algo_attrs.rs`); Cv25519 follows as an OID.
+const ALGO_ID_ECDH: u8 = 0x12;
+/// Cv25519 ECDH attribute bytes, as `set_algorithm(Decryption, Curve25519)` writes them.
+const ALGO_ATTRS_CV25519: [u8; 11] =
+    [0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
 
 /// A fabricated Ed25519 signature (64 bytes, the real signature length),
 /// returned by a successful `PSO: COMPUTE DIGITAL SIGNATURE`.
@@ -338,11 +345,14 @@ fn ok(mut data: Vec<u8>) -> Vec<u8> {
 /// inside the real card's `73` "Discretionary Data Objects" wrapper — a
 /// flat list of the same tags is indistinguishable to any caller that only
 /// ever looks things up by tag.
+#[allow(clippy::too_many_arguments)]
 fn build_application_related_data(
     manufacturer: u16,
     serial: u32,
     uif_sig: [u8; 2],
     algo_sig: &[u8],
+    algo_dec: &[u8],
+    uif_dec: [u8; 2],
     retries_pw1: u8,
     retries_pw3: u8,
 ) -> Vec<u8> {
@@ -367,7 +377,7 @@ fn build_application_related_data(
     // Algorithm Attributes, Decryption/Authentication slots (C2/C3): left
     // as RSA 2048 (real fixture bytes) — this crate doesn't touch these
     // slots, but a well-formed card has *some* algorithm set for them.
-    let algo_other = ALGO_ATTRS_RSA2048;
+    let algo_other = ALGO_ATTRS_RSA2048; // C3 (authentication) only
 
     // PW Status Bytes (tag C4, must be exactly 7 bytes per
     // `ocard/data/pw_status.rs`). Real YubiKey 5 fixture values for the
@@ -414,14 +424,14 @@ fn build_application_related_data(
     out.extend(tlv(&[0x5f, 0x52], &historical_bytes));
     out.extend(tlv(&[0xc0], &ext_caps));
     out.extend(tlv(&[0xc1], algo_sig));
-    out.extend(tlv(&[0xc2], &algo_other));
+    out.extend(tlv(&[0xc2], algo_dec));
     out.extend(tlv(&[0xc3], &algo_other));
     out.extend(tlv(&[0xc4], &pw_status));
     out.extend(tlv(&[0xc5], &fingerprints));
     out.extend(tlv(&[0xcd], &gen_times));
     out.extend(tlv(&[0xde], &key_info));
     out.extend(tlv(&[0xd6], &uif_sig)); // UifSig ("touch policy" for signing)
-    out.extend(tlv(&[0xd7], &[0x00, 0x20])); // UifDec
+    out.extend(tlv(&[0xd7], &uif_dec)); // UifDec
     out.extend(tlv(&[0xd8], &[0x00, 0x20])); // UifAuth
     out.extend(tlv(&[0xd9], &[0x00, 0x20])); // UifAttestation
     out
@@ -516,6 +526,18 @@ struct Inner {
     /// written — see this module's doc comment, section 4.
     algo_sig: Vec<u8>,
     signing_key_generated: bool,
+    /// Decryption slot's algorithm attributes (GET DATA tag `C2`).
+    algo_dec: Vec<u8>,
+    /// The decryption slot's X25519 secret, if it holds one.
+    dec_secret: Option<[u8; 32]>,
+    /// The decryption slot holds an RSA key.
+    dec_rsa: bool,
+    /// UIF for the decryption slot (tag `D7`).
+    uif_dec: [u8; 2],
+    /// PW1 (user, VERIFY P2 `0x82`) verified this session. Gates PSO:DECIPHER.
+    verified_pw1_user: bool,
+    /// Data field of the last PSO:DECIPHER.
+    last_deciphered: Vec<u8>,
     touch_timeout: bool,
     /// See [`FakeCard::with_card_removed_mid_signature`].
     card_removed_mid_signature: bool,
@@ -585,6 +607,12 @@ impl FakeCard {
                 uif_sig: [0x00, 0x20], // TouchPolicy::Off, Features::Button
                 algo_sig: ALGO_ATTRS_RSA2048.to_vec(),
                 signing_key_generated: false,
+                algo_dec: ALGO_ATTRS_RSA2048.to_vec(),
+                dec_secret: None,
+                dec_rsa: false,
+                uif_dec: [0x00, 0x20],
+                verified_pw1_user: false,
+                last_deciphered: Vec::new(),
                 touch_timeout: false,
                 card_removed_mid_signature: false,
                 verified_pw1_sign: false,
@@ -790,10 +818,48 @@ impl CardBackend for FakeCard {
         // comment, section 5).
         inner.verified_pw1_sign = false;
         inner.verified_pw3_admin = false;
+        inner.verified_pw1_user = false;
         drop(inner);
         Ok(Box::new(FakeCardTransaction {
             inner: Arc::clone(&self.inner),
         }))
+    }
+}
+
+fn x25519_public(secret: &[u8; 32]) -> [u8; 32] {
+    *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).as_bytes()
+}
+
+/// A fresh-looking secret for a generated decryption key. Not random;
+/// only distinct per call, which is all a fake needs.
+fn rand_secret() -> [u8; 32] {
+    static N: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+    [N.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 32]
+}
+
+impl FakeCard {
+    /// The decryption slot holds this X25519 key (a card with an existing key).
+    pub fn with_decryption_key(self, secret: [u8; 32]) -> Self {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.algo_dec = ALGO_ATTRS_CV25519.to_vec();
+            inner.dec_secret = Some(secret);
+        }
+        self
+    }
+    /// The decryption slot holds an RSA key (not usable for card unlock).
+    pub fn with_rsa_decryption_key(self) -> Self {
+        self.inner.lock().unwrap().dec_rsa = true;
+        self
+    }
+    pub fn decryption_key_generated(&self) -> bool {
+        self.inner.lock().unwrap().dec_secret.is_some()
+    }
+    pub fn decryption_public(&self) -> Option<[u8; 32]> {
+        self.inner.lock().unwrap().dec_secret.as_ref().map(x25519_public)
+    }
+    pub fn last_deciphered(&self) -> Vec<u8> {
+        self.inner.lock().unwrap().last_deciphered.clone()
     }
 }
 
@@ -833,6 +899,8 @@ impl CardTransaction for FakeCardTransaction {
                         card.serial,
                         card.uif_sig,
                         &card.algo_sig,
+                        &card.algo_dec,
+                        card.uif_dec,
                         card.pw1.retries_left,
                         card.pw3.retries_left,
                     )))
@@ -887,6 +955,7 @@ impl CardTransaction for FakeCardTransaction {
                 // verification for that key reference).
                 match p2 {
                     VERIFY_P2_SIGN => card.verified_pw1_sign = verified,
+                    VERIFY_P2_USER => card.verified_pw1_user = verified,
                     VERIFY_P2_ADMIN => card.verified_pw3_admin = verified,
                     _ => {}
                 }
@@ -899,6 +968,38 @@ impl CardTransaction for FakeCardTransaction {
                 // previously generated key (`ocard/commands.rs::gen_key` /
                 // `get_pub_key`). This fake always answers the Signing slot
                 // — later tasks only ever generate that one slot.
+                // CRT: B6 signature, B8 decryption, A4 authentication.
+                let crt = cmd.get(5).copied().unwrap_or(0xB6);
+                if crt == 0xB8 {
+                    return match p1 {
+                        0x80 => {
+                            if !card.verified_pw3_admin {
+                                return Ok(vec![0x69, 0x82]);
+                            }
+                            if card.algo_dec.first() != Some(&ALGO_ID_ECDH) {
+                                card.dec_rsa = true;
+                                let mut v = tlv(&[0x81], &FAKE_RSA_MODULUS);
+                                v.extend(tlv(&[0x82], &FAKE_RSA_EXPONENT));
+                                return Ok(ok(tlv(&[0x7f, 0x49], &v)));
+                            }
+                            let secret: [u8; 32] = rand_secret();
+                            card.dec_secret = Some(secret);
+                            Ok(ok(tlv(&[0x7f, 0x49], &tlv(&[0x86], &x25519_public(&secret)))))
+                        }
+                        0x81 => match (&card.dec_secret, card.dec_rsa) {
+                            (Some(s), _) => {
+                                Ok(ok(tlv(&[0x7f, 0x49], &tlv(&[0x86], &x25519_public(s)))))
+                            }
+                            (None, true) => {
+                                let mut v = tlv(&[0x81], &FAKE_RSA_MODULUS);
+                                v.extend(tlv(&[0x82], &FAKE_RSA_EXPONENT));
+                                Ok(ok(tlv(&[0x7f, 0x49], &v)))
+                            }
+                            (None, false) => Ok(vec![0x6A, 0x88]),
+                        },
+                        _ => Ok(vec![0x6A, 0x88]),
+                    };
+                }
                 match p1 {
                     0x80 => {
                         if !card.verified_pw3_admin {
@@ -959,6 +1060,18 @@ impl CardTransaction for FakeCardTransaction {
                         }
                     }
                 }
+                if (p1, p2) == (0x00, 0xc2)
+                    && let Some(&lc) = cmd.get(4)
+                    && let Some(bytes) = cmd.get(5..5 + lc as usize)
+                {
+                    card.algo_dec = bytes.to_vec();
+                }
+                if (p1, p2) == (0x00, 0xd7)
+                    && let Some(bytes) = cmd.get(5..)
+                    && bytes.len() >= 2
+                {
+                    card.uif_dec = [bytes[0], bytes[1]];
+                }
                 Ok(ok(vec![]))
             }
 
@@ -999,6 +1112,29 @@ impl CardTransaction for FakeCardTransaction {
                 let data = cmd.get(5..5 + lc).unwrap_or(&[]).to_vec();
                 card.last_signed_data = data;
                 Ok(ok(FAKE_ED25519_SIGNATURE.to_vec()))
+            }
+
+            ins::PSO if (p1, p2) == PSO_DECIPHER => {
+                if !card.verified_pw1_user {
+                    return Ok(vec![0x69, 0x82]); // SecurityStatusNotSatisfied
+                }
+                if card.touch_timeout {
+                    return Err(SmartcardError::Error("Transmit failed: Timeout".to_string()));
+                }
+                let lc = cmd.get(4).copied().unwrap_or(0) as usize;
+                let data = cmd.get(5..5 + lc).unwrap_or(&[]).to_vec();
+                card.last_deciphered = data.clone();
+                let Some(secret) = card.dec_secret else {
+                    return Ok(vec![0x6A, 0x88]);
+                };
+                // Cipher DO A6 { 7F49 { 86 <32-byte point> } }: the point is the tail.
+                let Some(eph) = data.len().checked_sub(32).map(|i| &data[i..]) else {
+                    return Ok(vec![0x6A, 0x80]); // IncorrectParametersCommandDataField
+                };
+                let eph: [u8; 32] = eph.try_into().unwrap();
+                let shared = x25519_dalek::StaticSecret::from(secret)
+                    .diffie_hellman(&x25519_dalek::PublicKey::from(eph));
+                Ok(ok(shared.as_bytes().to_vec()))
             }
 
             _ => Ok(vec![0x6D, 0x00]), // StatusBytes::INSNotSupported
@@ -1232,5 +1368,38 @@ mod tests {
             .expect_err("touch timeout should surface as an error");
 
         assert!(matches!(err, openpgp_card::Error::Smartcard(_)));
+    }
+
+    #[test]
+    fn the_decryption_slot_does_real_x25519() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let secret = [7u8; 32];
+        let fake = FakeCard::new().with_decryption_key(secret);
+        let probe = fake.clone();
+        let mut card = Card::new(fake).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let card_pub = probe.decryption_public().unwrap();
+        assert_eq!(card_pub, *PublicKey::from(&StaticSecret::from(secret)).as_bytes());
+
+        let eph = StaticSecret::from([9u8; 32]);
+        let eph_pub = PublicKey::from(&eph);
+        tx.verify_user_pin(SecretString::from("123456")).unwrap();
+        let shared = tx
+            .card()
+            .decipher(openpgp_card::ocard::crypto::Cryptogram::ECDH(eph_pub.as_bytes()))
+            .unwrap();
+        assert_eq!(shared, eph.diffie_hellman(&PublicKey::from(card_pub)).as_bytes().to_vec());
+        assert!(probe.last_deciphered().ends_with(eph_pub.as_bytes()));
+    }
+
+    #[test]
+    fn decipher_needs_the_user_pin() {
+        let mut card = Card::new(FakeCard::new().with_decryption_key([7u8; 32])).unwrap();
+        let mut tx = card.transaction().unwrap();
+        let err = tx
+            .card()
+            .decipher(openpgp_card::ocard::crypto::Cryptogram::ECDH(&[1u8; 32]))
+            .unwrap_err();
+        assert!(err.to_string().contains("ecurity status"), "{err}");
     }
 }
