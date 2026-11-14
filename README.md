@@ -68,6 +68,23 @@ for the full account.
   product concept — `aivyx-federation`'s `Identity` is the consumer that
   gives this primitive meaning.
 
+## Decryption slot (X25519 ECDH)
+
+The `decrypt` module uses the card's Decryption slot as an X25519
+key-agreement device:
+
+- `decryption_public_key` reads the slot's public key (`None` when empty;
+  `UnsupportedDecryptionKey` for a non-X25519 key such as RSA).
+- `generate_decryption_key` generates an X25519 key on the card with touch
+  policy Fixed. It never overwrites: an occupied slot returns
+  `DecryptionSlotOccupied` (owners often keep a GPG encryption key there).
+  Only `generate_decryption_key_overwriting` destroys an existing key.
+- `ecdh` verifies the User PIN (PW1 mode 82) and runs PSO:DECIPHER against
+  a peer public key; it needs the PIN and a physical touch.
+
+The crate never exports the secret key; the shared secret is returned in a
+zeroize-on-drop `SharedSecret`.
+
 ## Testing
 
 No real YubiKey/PC/SC hardware is available in this crate's own CI —

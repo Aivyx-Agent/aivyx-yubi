@@ -686,7 +686,7 @@ fn map_signing_pin_error(err: OpenpgpError) -> YubiError {
 /// otherwise special-case) falls through to the blanket
 /// `From<openpgp_card::Error>` impl, which maps it to [`YubiError::Other`]
 /// with the real underlying message preserved.
-fn map_sign_error(err: OpenpgpError) -> YubiError {
+pub(crate) fn map_sign_error(err: OpenpgpError) -> YubiError {
     match err {
         OpenpgpError::CardStatus(StatusBytes::ConditionOfUseNotSatisfied) => {
             YubiError::TouchTimeout

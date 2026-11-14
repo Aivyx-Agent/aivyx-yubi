@@ -316,7 +316,7 @@ pub fn set_signature_touch_policy_fixed(admin: &mut Card<Admin<'_, '_>>) -> Resu
 /// first 20, zero-padded if shorter) purely so distinct keys get visibly
 /// distinct on-card fingerprints, which is the only property that
 /// matters here.
-fn key_slot_fingerprint(
+pub(crate) fn key_slot_fingerprint(
     pub_key: &PublicKeyMaterial,
     _generated_at: KeyGenerationTime,
     _key_type: KeyType,
@@ -337,7 +337,7 @@ fn key_slot_fingerprint(
 /// [`YubiError::AdminAuthRequired`] instead of letting it fall through to
 /// the generic [`YubiError::Other`] catch-all — see this module's doc
 /// comment.
-fn map_admin_op_error(err: OpenpgpError) -> YubiError {
+pub(crate) fn map_admin_op_error(err: OpenpgpError) -> YubiError {
     match err {
         OpenpgpError::CardStatus(StatusBytes::SecurityStatusNotSatisfied) => {
             YubiError::AdminAuthRequired

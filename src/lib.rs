@@ -22,6 +22,7 @@
 //! way `sign.rs` does — one transaction open at a time, closed before
 //! the next begins.
 
+pub mod decrypt;
 pub mod discovery;
 pub mod pin;
 pub mod provision;
@@ -251,6 +252,15 @@ pub enum YubiError {
          re-bind to its current key before signing"
     )]
     SignatureKeyChanged,
+
+    /// The decryption slot already holds a key. `generate_decryption_key`
+    /// refuses rather than destroy it (many owners keep a GPG encryption key there).
+    #[error("the card's decryption slot already holds a key")]
+    DecryptionSlotOccupied,
+
+    /// The decryption slot holds no key, or a key that isn't X25519 (Cv25519 ECDH).
+    #[error("{0}")]
+    UnsupportedDecryptionKey(String),
 
     /// Catch-all for every other real error this crate's dependencies can
     /// report (raw APDU status words not covered above, transport

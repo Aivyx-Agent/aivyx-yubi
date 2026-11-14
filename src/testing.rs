@@ -213,6 +213,13 @@
 //!   reset/power-cycle, not per logical PC/SC transaction) chosen because
 //!   `transaction()` is the only session boundary the `CardBackend` trait
 //!   itself exposes.
+//! - **Decryption slot**: `GENERATE` with CRT `B8` and `PUT DATA` `C2`/`D7`
+//!   (algorithm attributes / touch policy) are answered for the Decryption
+//!   slot as for Signing; `PSO: DECIPHER` (P1 `80`, P2 `86`) is gated on
+//!   `VERIFY` with PW1 mode `82` and does real X25519 via `x25519-dalek`,
+//!   so ECDH results can be checked against the math. The secret behind a
+//!   generated key comes from `rand_secret`, which is deterministic per
+//!   call (distinct, not random).
 //! - **[`FakeCard`]'s state now lives behind a shared `Arc<Mutex<Inner>>`**
 //!   (fixed as part of `fix/card-safety`), so [`FakeCard`] itself is
 //!   `Clone` and a clone taken *before* the original is moved into
@@ -374,9 +381,11 @@ fn build_application_related_data(
     // *current* live state (`FakeCard::algo_sig`), not a fixed value —
     // see this module's doc comment, section 4, for why.
 
-    // Algorithm Attributes, Decryption/Authentication slots (C2/C3): left
-    // as RSA 2048 (real fixture bytes) — this crate doesn't touch these
-    // slots, but a well-formed card has *some* algorithm set for them.
+    // Algorithm Attributes, Decryption/Authentication slots (C2/C3): C2
+    // comes from the live decryption state (`algo_dec`: X25519 or RSA);
+    // C3 is left as RSA 2048 (real fixture bytes) — this crate doesn't
+    // touch the authentication slot, but a well-formed card has *some*
+    // algorithm set for it.
     let algo_other = ALGO_ATTRS_RSA2048; // C3 (authentication) only
 
     // PW Status Bytes (tag C4, must be exactly 7 bytes per
@@ -966,8 +975,8 @@ impl CardTransaction for FakeCardTransaction {
             ins::GENERATE_ASYMMETRIC_KEY_PAIR => {
                 // P1 0x80 = generate, 0x81 = read back the public key of a
                 // previously generated key (`ocard/commands.rs::gen_key` /
-                // `get_pub_key`). This fake always answers the Signing slot
-                // — later tasks only ever generate that one slot.
+                // `get_pub_key`). CRT B6 (Signing) and B8 (Decryption) are
+                // both answered, from their own slot state.
                 // CRT: B6 signature, B8 decryption, A4 authentication.
                 let crt = cmd.get(5).copied().unwrap_or(0xB6);
                 if crt == 0xB8 {
