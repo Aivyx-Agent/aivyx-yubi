@@ -28,7 +28,7 @@ card-backend = "0.2"
 secrecy = "0.10"
 # Only for testing.rs's FakeCard decryption slot (real X25519 math).
 x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 x25519-dalek = { version = "2", features = ["static_secrets"] }
